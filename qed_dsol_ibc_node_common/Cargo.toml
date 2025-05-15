@@ -1,0 +1,45 @@
+[package]
+edition = "2021"
+name    = "qed_dsol_ibc_node_common"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow     = { workspace = true }
+bincode      = { workspace = true }
+serde      = { workspace = true }
+borsh      = { workspace = true }
+serde_json      = { workspace = true }
+serde_repr      = { workspace = true }
+serde_with = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+lazy_static = { workspace = true }
+twox-hash = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+kvq = { path = "../kvq" }
+qed_dsol_bridge_core = { path = "../qed_dsol_bridge_core" }
+
+bitcoin = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+zerocopy = { workspace = true }
+
+
+lapin = "=2.5.0"
+prost-wkt-types = "0.6.0"
+
+tokio-executor-trait = { workspace = true }
+tokio-reactor-trait = { workspace = true }
+fred = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+doge-light-client = { workspace = true }
+qed-doge-data-link = { workspace = true }
+reqwest = { workspace = true }
+k256 = { workspace = true }
