@@ -1,5 +1,5 @@
 use bitcoin::{block::{Header, SimpleHeader}, hashes::Hash, Block};
-use doge_light_client::{core_data::{QAuxPow, QDogeBlock, QDogeBlockHeader, QHash256, QMerkleBranch, QStandardBlockHeader}, doge::transaction::BTCTransaction};
+use doge_light_client::{common_types::QHash256, core_data::{QAuxPow, QDogeBlock, QDogeBlockHeader, QMerkleBranch, QStandardBlockHeader}, doge::{coinbase_transaction::DogeAuxPowCoinbaseTransaction, transaction::BTCTransaction}};
 use futures::future;
 use qed_dsol_bridge_core::data::base_types::hash256::Hash256;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -156,7 +156,7 @@ fn btc_block_to_qdoge(btc_block: &Block) -> anyhow::Result<QDogeBlock> {
     let auxp = match &btc_block.header.aux_data {
         Some(ap) => {
             Some(QAuxPow {
-                coinbase_transaction: BTCTransaction::from_bytes(&bitcoin::consensus::encode::serialize(&ap.coinbase_tx))?,
+                coinbase_transaction: DogeAuxPowCoinbaseTransaction::from_bytes(&bitcoin::consensus::encode::serialize(&ap.coinbase_tx))?,
                 block_hash: ap.block_hash.to_raw_hash().to_byte_array().into(),
                 coinbase_branch: QMerkleBranch {
                     side_mask: ap.coinbase_branch.side_mask,
@@ -186,7 +186,7 @@ fn btc_block_header_to_qdoge(btc_header: &Header) -> anyhow::Result<QDogeBlockHe
     let auxp = match &btc_header.aux_data {
         Some(ap) => {
             Some(QAuxPow {
-                coinbase_transaction: BTCTransaction::from_bytes(&bitcoin::consensus::encode::serialize(&ap.coinbase_tx))?,
+                coinbase_transaction: DogeAuxPowCoinbaseTransaction::from_bytes(&bitcoin::consensus::encode::serialize(&ap.coinbase_tx))?,
                 block_hash: ap.block_hash.to_raw_hash().to_byte_array().into(),
                 coinbase_branch: QMerkleBranch {
                     side_mask: ap.coinbase_branch.side_mask,

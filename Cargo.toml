@@ -20,8 +20,8 @@ async-trait = { version = "0.1.80" }
 base64 = "0.21.0"
 bitcoin = { git = "https://github.com/QEDProtocol/rust-dogecoin", rev = "9b52ed2ddc18c2062c741b7df7a6e70aabde3bb8", features = [ "serde" ] }
 chrono = "0.4.39"
-doge-light-client = { path = "../dlc-lib/doge-light-client", default-features = false, features = ["sha2", "borsh"] }
-qed-doge-data-link = { path = "../dlc-lib/qed-doge-data-link" }
+doge-light-client = { path = "../dlc-lib/doge-light-client-workspace/doge-light-client", default-features = false, features = ["sha2", "serialize_borsh", "serialize_bytemuck", "serialize_speedy"] }
+qed-doge-data-link = { package = "psy-doge-data-link", path = "../dlc-lib/doge-light-client-workspace/psy-doge-data-link" }
 
 rand = "0.8"
 rand_core = "0.6.0"
@@ -43,8 +43,8 @@ qed-data-loader-v3-program-client = { git = "https://github.com/cf/data-loader-v
 zerocopy = { git = "https://github.com/cf/zerocopy-borsh-serde", branch = "borsh-serde-v0.8.23", default-features = false, features = ["borsh", "std", "serde"] }
 zerocopy-derive = { git = "https://github.com/cf/zerocopy-borsh-serde", branch = "borsh-serde-v0.8.23", default-features = false, features = ["borsh", "std", "serde"]  }
 
-solana-sdk = "~2.1"
-solana-client = { version = "~2.1", default-features = false }
+solana-sdk = "=2.2.1"
+solana-client = { version = "=2.2.1", default-features = false }
 
 
 

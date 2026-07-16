@@ -24,7 +24,7 @@ substantial portions of the software:
 with contributions from Carter Feldman (https://x.com/cmpeq)."
 */
 
-use doge_light_client::{block_data_tracker::BlockDataTracker, chain_state::QEDDogeChainStateCore, core_data::QHash256, hash::merkle::fixed_append_tree::FixedMerkleAppendTree};
+use doge_light_client::{block_data_tracker::BlockDataTracker, chain_state::QEDDogeChainStateCore, common_types::QHash256, hash::merkle::fixed_append_tree::FixedMerkleAppendTree};
 
 
 
@@ -51,10 +51,9 @@ pub const QDOGE_BRIDGE_BLOCK_TREE_HEIGHT: usize = 32;
 
 pub type QEDDogeChainState = QEDDogeChainStateCore<
     QDOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE,
-    QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS,
     QDOGE_BRIDGE_BLOCK_TREE_HEIGHT,
 >;
 
-pub type QBlockDataTracker = BlockDataTracker<QDOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE, QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS>;
+pub type QBlockDataTracker = BlockDataTracker<QDOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE>;
 pub type QBlockTreeTracker = FixedMerkleAppendTree<QHash256, QDOGE_BRIDGE_BLOCK_TREE_HEIGHT>;
 

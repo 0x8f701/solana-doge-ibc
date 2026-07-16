@@ -159,10 +159,10 @@ impl SimpleRPCBlockNotifier {
         }else{
             self.timer.event(format!("block # {} with hash {} no longer in best chain, reverting!", self.state.chain_state.get_tip_block_number(), Hash256(last_block_hash).to_reversed_hex_string()));
 
-            let last_finalized = self.state.chain_state.get_finalized_block_hash();
+            let last_finalized = self.state.chain_state.get_finalized_block_hash(QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS as u32);
             let last_finalized_state = self.block_rpc.get_block_status_by_hash(Hash256(last_finalized)).await?;
             if last_finalized_state.in_best_chain == false {
-                self.timer.event(format!("THIS IS BAD: the last finalized block ({} at #{}) is no longer in the best chain, lets keep praying it will be again", hex::encode(&self.state.chain_state.get_finalized_block_hash()), self.state.chain_state.get_finalized_block_number()));
+                self.timer.event(format!("THIS IS BAD: the last finalized block ({} at #{}) is no longer in the best chain, lets keep praying it will be again", hex::encode(&self.state.chain_state.get_finalized_block_hash(QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS as u32)), self.state.chain_state.get_finalized_block_number(QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS as u32)));
                 return Ok(());
             }
             for i in 0..QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS {
@@ -175,7 +175,7 @@ impl SimpleRPCBlockNotifier {
                     return Ok(());
                 }
             }
-            self.timer.event(format!("THIS IS BAD: the last finalized block ({} at #{}) is no longer in the best chain, lets keep praying it will be again", hex::encode(&self.state.chain_state.get_finalized_block_hash()), self.state.chain_state.get_finalized_block_number()));
+            self.timer.event(format!("THIS IS BAD: the last finalized block ({} at #{}) is no longer in the best chain, lets keep praying it will be again", hex::encode(&self.state.chain_state.get_finalized_block_hash(QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS as u32)), self.state.chain_state.get_finalized_block_number(QDOGE_BRIDGE_REQUIRED_CONFIRMATIONS as u32)));
             return Ok(());
         }
 
@@ -220,11 +220,20 @@ impl SimpleRPCBlockNotifier {
 
         let old_state = self.state.chain_state.clone();
 
-        match self
+        let tip_record = self
             .state
             .chain_state
-            .append_block::<NC>(new_block_number, &header, None)
-        {
+            .block_data_tracker
+            .get_record(last_block_number)?;
+        match self.state.chain_state.append_block::<NC>(
+            new_block_number,
+            &header,
+            tip_record.auto_claimed_txo_tree_root,
+            tip_record.auto_claimed_deposits_tree_root,
+            tip_record.auto_claimed_deposits_next_index.into(),
+            0,
+            None,
+        ) {
             Ok(_) => {
                 self.timer.event(format!(
                     "appended block # {} to chain state",

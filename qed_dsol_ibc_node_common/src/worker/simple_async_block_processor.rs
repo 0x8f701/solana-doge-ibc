@@ -48,7 +48,6 @@ use qed_dsol_bridge_core::{
     },
     utils::debug_timer::DebugTimer,
 };
-use zerocopy::IntoBytes;
 
 #[derive(Clone, Debug)]
 pub struct SimpleAsyncBlockProcessor {
@@ -173,7 +172,7 @@ impl SimpleAsyncBlockProcessor {
                 ),
             );
 
-            let init_chain_state_bytes = chain_state.as_bytes().to_vec();
+            let init_chain_state_bytes = borsh::to_vec(&chain_state)?;
             bss.injest_ibc_block_state_imm(&IBCBlockState {
                 chain_state: chain_state.clone(),
             })
@@ -444,11 +443,20 @@ impl SimpleAsyncBlockProcessor {
             anyhow::bail!("incoming block header's previous_block_hash field ({}) does not match the tip block hash ({})", hex::encode(&incoming_previous_block_hash), hex::encode(&last_block_hash));
         }
 
-        match self
+        let tip_record = self
             .state
             .chain_state
-            .append_block::<NC>(new_block_number, &header, None)
-        {
+            .block_data_tracker
+            .get_record(last_block_number)?;
+        match self.state.chain_state.append_block::<NC>(
+            new_block_number,
+            &header,
+            tip_record.auto_claimed_txo_tree_root,
+            tip_record.auto_claimed_deposits_tree_root,
+            tip_record.auto_claimed_deposits_next_index.into(),
+            0,
+            None,
+        ) {
             Ok(_) => {
                 self.timer.event(format!(
                     "appended block # {} with hash {} to chain state",

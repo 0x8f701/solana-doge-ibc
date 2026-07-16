@@ -24,9 +24,9 @@ substantial portions of the software:
 with contributions from Carter Feldman (https://x.com/cmpeq)."
 */
 
+use borsh::BorshDeserialize;
 use qed_dsol_bridge_core::{config::network_constants::QEDDogeChainState, data::{scrypt_proof::DogeBlockScryptProofOutput, state::IBCBlockState}};
 use serde::{Deserialize, Serialize};
-use zerocopy::FromBytes;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,18 +47,46 @@ pub struct SCCGetIBCStateResponse {
     pub state: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockUpdateRequestBody {
+    pub idempotency_key: String,
+    pub proof_hex: String,
+    pub header_hex: String,
+    pub mint_buffer: String,
+    pub txo_buffer: String,
+    pub mint_buffer_bump: u8,
+    pub txo_buffer_bump: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockUpdateResponse {
+    pub signature: String,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolSubmitterClient {
     pub base_url: String,
     pub api_key: String,
 }
 impl SolSubmitterClient {
+    /// Constructs the legacy IBC-v3 client, whose existing methods use x-api-key.
+
     pub fn new(url: String, api_key: String) -> Self {
         Self {
             base_url: format!("{}/api/v1", url),
             api_key,
         }
     }
+    pub fn new_with_bearer_token(url: String, bearer_token: String) -> Self {
+        Self {
+            base_url: format!("{}/api/v1", url),
+            api_key: bearer_token,
+        }
+    }
+
     pub async fn init_ibc_program_state(&self, block_state_bytes: &[u8]) -> anyhow::Result<()> {
         let url = format!("{}/init-ibc", self.base_url);
         let client = reqwest::Client::new();
@@ -81,8 +109,8 @@ impl SolSubmitterClient {
     pub async fn get_ibc_program_state_full(&self) -> anyhow::Result<Option<QEDDogeChainState>> {
         match self.get_ibc_program_state_inner().await? {
             Some(state_bytes) => {
-                match QEDDogeChainState::ref_from_bytes(&state_bytes[33..]) {
-                    Ok(state) => Ok(Some(state.clone())),
+                match QEDDogeChainState::try_from_slice(&state_bytes[33..]) {
+                    Ok(state) => Ok(Some(state)),
                     Err(e) => Err(anyhow::anyhow!("Failed to parse IBC block state: {:?}", e)),
                 }
             }
@@ -129,6 +157,29 @@ impl SolSubmitterClient {
             Ok(())
         } else {
             Err(anyhow::anyhow!("Failed to submit block result: {:?}", res.text().await?))
+        }
+    }
+    /// Submits the current bridge block_update contract using optional Bearer auth.
+    pub async fn block_update(
+        &self,
+        request: &BlockUpdateRequestBody,
+    ) -> anyhow::Result<BlockUpdateResponse> {
+        let url = format!("{}/block-update", self.base_url);
+        let client = reqwest::Client::new();
+        let mut builder = client.post(&url).json(request);
+        if !self.api_key.is_empty() {
+            builder = builder.bearer_auth(&self.api_key);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response.json().await?)
+        } else {
+            Err(anyhow::anyhow!(
+                "block-update submission failed with HTTP {}: {}",
+                status,
+                response.text().await?
+            ))
         }
     }
 }
