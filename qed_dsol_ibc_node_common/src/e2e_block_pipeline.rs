@@ -5,7 +5,7 @@ use doge_bridge_client::{BridgeApi, BridgeClient, BridgeClientConfigBuilder, Pen
 use doge_light_client::{
     chain_state::QEDDogeChainStateCore,
     common_types::QHash256,
-    constants::{DogeNetworkConfig, DogeRegTestConfig},
+    constants::{DogeNetworkConfig, DogeRegTestConfig, DogeTestNetConfig},
     core_data::{QDogeBlock, QDogeBlockHeader},
     hash::sha256_impl::{
         hash_impl_btc_hash256_two_to_one_bytes, hash_impl_sha256_bytes,
@@ -58,7 +58,10 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{read_keypair_file, Keypair, Signature, Signer},
 };
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
+
 
 use crate::{
     doge_link_rpc_async::DogeLinkElectrsAsyncClient,
@@ -74,6 +77,12 @@ const PROOF_SIZE: usize = 356;
 const PUBLIC_VALUES_SIZE: usize = 32;
 const CHECKPOINT_PREFIX: &str = "PDOGE-E2E-BLOCK-CHECKPOINT-V3";
 const EVIDENCE_SCHEMA_VERSION: u32 = 2;
+pub const REGTEST_BLOCK_VK_HASH: [u8; 32] = hex_literal::hex!(
+    "00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c"
+);
+pub const TESTNET_BLOCK_VK_HASH: [u8; 32] = hex_literal::hex!(
+    "006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd"
+);
 
 const SOL_TIP_BLOCK_HASH: std::ops::Range<usize> = 0..32;
 const SOL_TIP_BLOCK_MERKLE_ROOT: std::ops::Range<usize> = 32..64;
@@ -97,11 +106,42 @@ type BridgeState = QEDDogeChainStateCore<
     PSY_DOGE_BRIDGE_BLOCK_TREE_HEIGHT,
 >;
 
-// The SP1 block guest and this pipeline both use DogeRegTestConfig, matching
-// the regtest consensus parameters used by the local dogecoind regtest E2E.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DogeNetworkProfile {
+    #[default]
+    Regtest,
+    Testnet,
+}
+
+impl DogeNetworkProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Regtest => "regtest",
+            Self::Testnet => "testnet",
+        }
+    }
+
+    pub const fn default_vk_hash(self) -> [u8; 32] {
+        match self {
+            Self::Regtest => REGTEST_BLOCK_VK_HASH,
+            Self::Testnet => TESTNET_BLOCK_VK_HASH,
+        }
+    }
+
+    pub fn default_block_elf_path(self) -> PathBuf {
+        let name = match self {
+            Self::Regtest => "block-transition",
+            Self::Testnet => "block-transition-testnet",
+        };
+        PathBuf::from("../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release")
+            .join(name)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct E2EBlockPipelineConfig {
+    pub network: DogeNetworkProfile,
     pub electrs_url: String,
     pub redis_url: String,
     pub sender_url: String,
@@ -307,6 +347,277 @@ struct ProverOutput {
     vk_hash: [u8; 32],
 }
 
+#[derive(Debug)]
+struct ProverRequestError(String);
+
+impl std::fmt::Display for ProverRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProverRequestError {}
+
+
+#[derive(Debug, Deserialize)]
+struct ProverIdentityResponse {
+    kind: String,
+    network: String,
+    block_elf_path: String,
+    block_elf_sha256: String,
+    vkey_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProverProofResponse {
+    kind: String,
+    request_id: String,
+    ok: bool,
+    network: Option<String>,
+    block_elf_path: Option<String>,
+    block_elf_sha256: Option<String>,
+    vkey_hash: Option<String>,
+    proof_path: Option<String>,
+    proof_size: Option<usize>,
+    proof_bytes: Option<String>,
+    public_values_path: Option<String>,
+    public_values_size: Option<usize>,
+    public_values: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProverProofRequest<'a> {
+    request_id: &'a str,
+    old_state: String,
+    witness: String,
+    custody_script_config: String,
+    required_confirmations: u32,
+    flat_fee: u64,
+    fee_num: u64,
+    fee_den: u64,
+    old_header: String,
+    new_header: String,
+    config_params: String,
+}
+
+struct ProverDaemon {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    stderr: Vec<u8>,
+    vk_hash: [u8; 32],
+}
+
+impl ProverDaemon {
+    async fn start(config: &E2EBlockPipelineConfig) -> anyhow::Result<Self> {
+        let mut command = Command::new(&config.gen_proof_path);
+        command
+            .arg("--network")
+            .arg(config.network.as_str())
+            .arg("--daemon")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("gen-proof daemon stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("gen-proof daemon stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("gen-proof daemon stderr was not piped"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut bytes = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut bytes).await?;
+            Ok(bytes)
+        });
+        let mut daemon = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr: Vec::new(),
+            stderr_task: Some(stderr_task),
+            vk_hash: [0; 32],
+        };
+        let identity_line = match daemon.read_response_line().await {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = daemon.child.kill().await;
+                let _ = daemon.child.wait().await;
+                let stderr = daemon.finish_stderr().await;
+                return Err(anyhow::anyhow!(
+                    "gen-proof daemon startup failed: {error:#}; stderr:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                ));
+            }
+        };
+        let identity: ProverIdentityResponse = match serde_json::from_slice(&identity_line) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = daemon.child.kill().await;
+                let _ = daemon.child.wait().await;
+                let stderr = daemon.finish_stderr().await;
+                anyhow::bail!(
+                    "malformed gen-proof identity response: {error}; stderr:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+        };
+        match validate_prover_identity(config, &identity).await {
+            Ok(vk_hash) => daemon.vk_hash = vk_hash,
+            Err(error) => {
+                let _ = daemon.child.kill().await;
+                let _ = daemon.child.wait().await;
+                let stderr = daemon.finish_stderr().await;
+                return Err(anyhow::anyhow!(
+                    "gen-proof daemon identity validation failed: {error:#}; stderr:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                ));
+            }
+        }
+        Ok(daemon)
+    }
+
+    async fn prove(
+        &mut self,
+        config: &E2EBlockPipelineConfig,
+        request_id: &str,
+        old_state: &[u8],
+        witness: &[u8],
+        old_header: &[u8; HEADER_SIZE],
+        new_header: &[u8; HEADER_SIZE],
+    ) -> anyhow::Result<ProverOutput> {
+        let request = ProverProofRequest {
+            request_id,
+            old_state: hex::encode(old_state),
+            witness: hex::encode(witness),
+            custody_script_config: hex::encode(config.custody_script_config),
+            required_confirmations: config.required_confirmations,
+            flat_fee: deposit_flat_fee(&config.config_params),
+            fee_num: deposit_fee_numerator(&config.config_params),
+            fee_den: deposit_fee_denominator(&config.config_params),
+            old_header: hex::encode(old_header),
+            new_header: hex::encode(new_header),
+            config_params: hex::encode(config.config_params),
+        };
+        let mut request_line = serde_json::to_vec(&request)?;
+        request_line.push(b'\n');
+        self.stdin.write_all(&request_line).await?;
+        self.stdin.flush().await?;
+
+        let response_line = self.read_response_line().await?;
+        let response: ProverProofResponse = serde_json::from_slice(&response_line)
+            .map_err(|error| anyhow::anyhow!("malformed gen-proof response: {error}"))?;
+        if response.kind != "proof" {
+            anyhow::bail!("gen-proof response kind was '{}', expected 'proof'", response.kind);
+        }
+        if response.request_id != request_id {
+            anyhow::bail!(
+                "gen-proof response request id '{}' did not match '{request_id}'",
+                response.request_id
+            );
+        }
+        if !response.ok {
+            return Err(anyhow::Error::new(ProverRequestError(format!(
+                "gen-proof request {request_id} failed: {}",
+                response.error.as_deref().unwrap_or("missing error message")
+            ))));
+        }
+        validate_proof_response(config, self.vk_hash, &response)?;
+        let proof = decode_required_response_bytes(response.proof_bytes.as_deref(), "proof_bytes")?;
+        let public_values = decode_required_response_bytes(
+            response.public_values.as_deref(),
+            "public_values",
+        )?;
+        if response.proof_size != Some(proof.len()) {
+            anyhow::bail!(
+                "gen-proof proof_size {:?} did not match {} returned bytes",
+                response.proof_size,
+                proof.len()
+            );
+        }
+        if response.public_values_size != Some(public_values.len()) {
+            anyhow::bail!(
+                "gen-proof public_values_size {:?} did not match {} returned bytes",
+                response.public_values_size,
+                public_values.len()
+            );
+        }
+        tokio::fs::write(PROOF_PATH, proof).await?;
+        tokio::fs::write(PUBLIC_VALUES_PATH, public_values).await?;
+        let stderr = self.finish_stderr().await;
+        Ok(ProverOutput {
+            stdout: response_line,
+            stderr,
+            vk_hash: self.vk_hash,
+        })
+    }
+
+    async fn read_response_line(&mut self) -> anyhow::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let bytes_read = self.stdout.read_until(b'\n', &mut line).await?;
+        if bytes_read == 0 {
+            let status = self.child.wait().await?;
+            let stderr = self.finish_stderr().await;
+            anyhow::bail!(
+                "gen-proof daemon closed stdout with {status}; stderr:\n{}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            anyhow::bail!("gen-proof daemon returned an empty response line");
+        }
+        Ok(line)
+    }
+
+    async fn finish_stderr(&mut self) -> Vec<u8> {
+        if self
+            .stderr_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(task) = self.stderr_task.take() {
+                if let Ok(Ok(bytes)) = task.await {
+                    self.stderr.extend_from_slice(&bytes);
+                }
+            }
+        }
+        self.stderr.clone()
+    }
+
+    async fn terminate(mut self) {
+        drop(self.stdin);
+        match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                let _ = self.child.kill().await;
+            }
+        }
+        if let Some(task) = self.stderr_task.take() {
+            if let Ok(Ok(bytes)) = task.await {
+                self.stderr.extend_from_slice(&bytes);
+            }
+        }
+    }
+}
+
+enum ProverProcess {
+    Daemon(ProverDaemon),
+    OneShot,
+}
+
 #[derive(Serialize)]
 struct ProverInputsEvidence {
     schema_version: u32,
@@ -350,6 +661,7 @@ pub struct E2EBlockPipeline {
     redis: fred::prelude::Pool,
     checkpoint_key: String,
     checkpoint: PipelineCheckpoint,
+    prover: ProverProcess,
 }
 
 impl E2EBlockPipeline {
@@ -406,7 +718,11 @@ impl E2EBlockPipeline {
             );
         }
 
-        let checkpoint_key = format!("{CHECKPOINT_PREFIX}-{}", config.redis_seed);
+        let checkpoint_key = format!(
+            "{CHECKPOINT_PREFIX}-{}-{}",
+            config.network.as_str(),
+            config.redis_seed
+        );
         let block_rpc = DogeLinkElectrsAsyncClient::new(config.electrs_url.clone());
         let checkpoint = match redis.get::<Option<String>, _>(&checkpoint_key).await? {
             Some(value) => serde_json::from_str(&value)?,
@@ -414,6 +730,11 @@ impl E2EBlockPipeline {
         };
         validate_checkpoint(&checkpoint)?;
 
+        let prover = match ProverDaemon::start(&config).await {
+            Ok(prover) => ProverProcess::Daemon(prover),
+            Err(error) if daemon_mode_unsupported(&error) => ProverProcess::OneShot,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             sender: SolSubmitterClient::new_with_bearer_token(
                 config.sender_url.clone(),
@@ -425,6 +746,7 @@ impl E2EBlockPipeline {
             checkpoint_key,
             checkpoint,
             config,
+            prover,
         })
     }
 
@@ -449,8 +771,99 @@ impl E2EBlockPipeline {
             return Ok(false);
         }
 
-        self.process_height::<DogeRegTestConfig>(next_height).await?;
+        match self.config.network {
+            DogeNetworkProfile::Regtest => {
+                self.process_height::<DogeRegTestConfig>(next_height).await?
+            }
+            DogeNetworkProfile::Testnet => {
+                self.process_height::<DogeTestNetConfig>(next_height).await?
+            }
+        }
         Ok(true)
+    }
+
+    async fn run_gen_proof(
+        &mut self,
+        height: u32,
+        old_state: &[u8],
+        witness: &[u8],
+        old_header: &[u8; HEADER_SIZE],
+        new_header: &[u8; HEADER_SIZE],
+    ) -> anyhow::Result<ProverOutput> {
+        if matches!(&self.prover, ProverProcess::OneShot) {
+            return run_gen_proof_one_shot(
+                &self.config,
+                old_state,
+                witness,
+                old_header,
+                new_header,
+            )
+            .await;
+        }
+
+        prepare_prover_request(
+            &self.config,
+            old_state,
+            witness,
+            old_header,
+            new_header,
+        )
+        .await?;
+        let request_id = format!("block-{height}");
+        let first_result = match &mut self.prover {
+            ProverProcess::Daemon(prover) => {
+                prover
+                    .prove(
+                        &self.config,
+                        &request_id,
+                        old_state,
+                        witness,
+                        old_header,
+                        new_header,
+                    )
+                    .await
+            }
+            ProverProcess::OneShot => unreachable!("handled above"),
+        };
+        let first_error = match first_result {
+            Ok(output) => return Ok(output),
+            Err(error) if error.downcast_ref::<ProverRequestError>().is_some() => {
+                return Err(error);
+            }
+            Err(error) => error,
+        };
+
+        let old_process = std::mem::replace(&mut self.prover, ProverProcess::OneShot);
+        if let ProverProcess::Daemon(prover) = old_process {
+            prover.terminate().await;
+        }
+        let mut prover = ProverDaemon::start(&self.config).await.map_err(|restart_error| {
+            anyhow::anyhow!(
+                "gen-proof daemon request failed: {first_error:#}; restart/revalidation failed: {restart_error:#}"
+            )
+        })?;
+        let retry_result = prover
+            .prove(
+                &self.config,
+                &request_id,
+                old_state,
+                witness,
+                old_header,
+                new_header,
+            )
+            .await;
+        match retry_result {
+            Ok(output) => {
+                self.prover = ProverProcess::Daemon(prover);
+                Ok(output)
+            }
+            Err(retry_error) => {
+                prover.terminate().await;
+                Err(anyhow::anyhow!(
+                    "gen-proof daemon request failed: {first_error:#}; retry after restart failed: {retry_error:#}"
+                ))
+            }
+        }
     }
 
     async fn process_height<NC: DogeNetworkConfig>(&mut self, height: u32) -> anyhow::Result<()> {
@@ -563,14 +976,15 @@ impl E2EBlockPipeline {
         )?;
         let new_state_bytes = borsh::to_vec(&new_state)?;
 
-        let prover_output = run_gen_proof(
-            &self.config,
-            &old_state_bytes,
-            &witness_bytes,
-            &old_header,
-            &new_header,
-        )
-        .await?;
+        let prover_output = self
+            .run_gen_proof(
+                height,
+                &old_state_bytes,
+                &witness_bytes,
+                &old_header,
+                &new_header,
+            )
+            .await?;
 
         let proof = tokio::fs::read(PROOF_PATH).await?;
         let public_values = tokio::fs::read(PUBLIC_VALUES_PATH).await?;
@@ -648,21 +1062,39 @@ impl E2EBlockPipeline {
             self.checkpoint.claim_frontier.clone()
         };
 
-        let mut txo_block_history = self.checkpoint.txo_block_history.clone();
-        if txo_block_history.len() != height as usize {
-            anyhow::bail!(
-                "TXO block history length {} does not match next height {height}",
-                txo_block_history.len()
-            );
-        }
-        txo_block_history.push(evaluation.block_txo_root);
-        let txo_siblings = sparse_sha256_merkle_siblings(
-            &txo_block_history,
-            height as usize,
-            TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
-            TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
-        )?;
-        let txo_block_frontier = MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings);
+        let (txo_block_frontier, txo_block_history) =
+            if self.checkpoint.txo_block_history.is_empty() {
+                let txo_siblings = sequential_next_leaf_siblings(
+                    &self.checkpoint.txo_block_frontier,
+                    height,
+                    TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+                    TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+                    "TXO block frontier",
+                )?;
+                (
+                    MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+                    Vec::new(),
+                )
+            } else {
+                let mut history = self.checkpoint.txo_block_history.clone();
+                if history.len() != height as usize {
+                    anyhow::bail!(
+                        "TXO block history length {} does not match next height {height}",
+                        history.len()
+                    );
+                }
+                history.push(evaluation.block_txo_root);
+                let txo_siblings = sparse_sha256_merkle_siblings(
+                    &history,
+                    height as usize,
+                    TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+                    TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+                )?;
+                (
+                    MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+                    history,
+                )
+            };
 
         let mut pending_finalization = self.checkpoint.pending_finalization.clone();
         pending_finalization.insert(height, BlockBufferCommitment::from_evaluation(&evaluation));
@@ -816,9 +1248,6 @@ async fn initialize_checkpoint(
     let state = PsyDogeBridgeState::from_init_data(
         &InitBlockDataIBC::new_from_block_headers_empty_tree(&headers, start_height),
     );
-    if start_height > 1_000_000 {
-        anyhow::bail!("start height is too large for initialized TXO frontier history");
-    }
     let pending_finalization = BTreeMap::new();
 
     let claim_siblings: [QHash256; AUTO_CLAIM_DEPOSITS_TREE_HEIGHT] =
@@ -827,6 +1256,14 @@ async fn initialize_checkpoint(
         core::array::from_fn(|index| {
             SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT + index]
         });
+    let txo_block_history = if start_height <= 1_000_000 {
+        vec![
+            SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT];
+            start_height as usize + 1
+        ]
+    } else {
+        Vec::new()
+    };
 
     Ok(PipelineCheckpoint {
         height: start_height,
@@ -839,10 +1276,7 @@ async fn initialize_checkpoint(
             &txo_siblings,
         ),
         claim_history: Vec::new(),
-        txo_block_history: vec![
-            SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT];
-            start_height as usize + 1
-        ],
+        txo_block_history,
         pending_finalization,
     })
 }
@@ -1444,37 +1878,17 @@ fn build_new_solana_header(
     Ok(new_header)
 }
 
-async fn run_gen_proof(
+async fn run_gen_proof_one_shot(
     config: &E2EBlockPipelineConfig,
     old_state: &[u8],
     witness: &[u8],
     old_header: &[u8; HEADER_SIZE],
     new_header: &[u8; HEADER_SIZE],
 ) -> anyhow::Result<ProverOutput> {
-    for path in [PROOF_PATH, PUBLIC_VALUES_PATH] {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if std::env::var_os("DOGE_SAVE_PROVER_ARGS").is_some() {
-        let args = serde_json::json!({
-            "old_state": hex::encode(old_state),
-            "witness": hex::encode(witness),
-            "custody_script_config": hex::encode(config.custody_script_config),
-            "required_confirmations": config.required_confirmations,
-            "flat_fee": deposit_flat_fee(&config.config_params),
-            "fee_num": deposit_fee_numerator(&config.config_params),
-            "fee_den": deposit_fee_denominator(&config.config_params),
-            "old_header": hex::encode(old_header),
-            "new_header": hex::encode(new_header),
-            "config_params": hex::encode(config.config_params),
-        });
-        tokio::fs::write("/tmp/psy-block-prover-args.json", serde_json::to_vec_pretty(&args)?).await?;
-    }
-
+    prepare_prover_request(config, old_state, witness, old_header, new_header).await?;
     let output = Command::new(&config.gen_proof_path)
+        .arg("--network")
+        .arg(config.network.as_str())
         .arg("--old-state")
         .arg(hex::encode(old_state))
         .arg("--witness")
@@ -1508,7 +1922,20 @@ async fn run_gen_proof(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let vk_hash = parse_vkey_hash(&output.stdout)?;
+    let prover_network = parse_prover_field(&output.stdout, "network")?;
+    if prover_network != config.network.as_str() {
+        anyhow::bail!(
+            "SP1 prover network mismatch: expected {}, got {prover_network}",
+            config.network.as_str()
+        );
+    }
+    let prover_elf_path = parse_prover_field(&output.stdout, "block_elf_path")?;
+    let prover_elf_sha256 = parse_prover_field(&output.stdout, "block_elf_sha256")?;
+    validate_prover_elf(config, prover_elf_path, prover_elf_sha256).await?;
+    let vk_hash = decode_prover_hash(
+        parse_prover_field(&output.stdout, "vkey_hash")?,
+        "SP1 program VK hash",
+    )?;
     if vk_hash != config.expected_vk_hash {
         anyhow::bail!(
             "SP1 program VK mismatch: expected {}, got {}",
@@ -1523,16 +1950,171 @@ async fn run_gen_proof(
     })
 }
 
-fn parse_vkey_hash(stdout: &[u8]) -> anyhow::Result<[u8; 32]> {
-    let stdout = std::str::from_utf8(stdout)?;
-    let value = stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("vkey_hash:"))
-        .ok_or_else(|| anyhow::anyhow!("gen-proof stdout did not contain vkey_hash"))?
-        .trim();
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    decode_fixed::<32>(value, "SP1 program VK hash")
+fn daemon_mode_unsupported(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("unexpected argument '--daemon'") || message.contains("unexpected argument '--network'")
 }
+
+fn parse_prover_field<'a>(stdout: &'a [u8], field: &str) -> anyhow::Result<&'a str> {
+    let stdout = std::str::from_utf8(stdout)?;
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&format!("{field}:")))
+        .map(str::trim)
+        .ok_or_else(|| anyhow::anyhow!("gen-proof stdout did not contain {field}"))
+}
+
+async fn prepare_prover_request(
+    config: &E2EBlockPipelineConfig,
+    old_state: &[u8],
+    witness: &[u8],
+    old_header: &[u8; HEADER_SIZE],
+    new_header: &[u8; HEADER_SIZE],
+) -> anyhow::Result<()> {
+    for path in [PROOF_PATH, PUBLIC_VALUES_PATH] {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if std::env::var_os("DOGE_SAVE_PROVER_ARGS").is_some() {
+        let args = serde_json::json!({
+            "network": config.network.as_str(),
+            "old_state": hex::encode(old_state),
+            "witness": hex::encode(witness),
+            "custody_script_config": hex::encode(config.custody_script_config),
+            "required_confirmations": config.required_confirmations,
+            "flat_fee": deposit_flat_fee(&config.config_params),
+            "fee_num": deposit_fee_numerator(&config.config_params),
+            "fee_den": deposit_fee_denominator(&config.config_params),
+            "old_header": hex::encode(old_header),
+            "new_header": hex::encode(new_header),
+            "config_params": hex::encode(config.config_params),
+        });
+        tokio::fs::write("/tmp/psy-block-prover-args.json", serde_json::to_vec_pretty(&args)?).await?;
+    }
+    Ok(())
+}
+
+async fn validate_prover_identity(
+    config: &E2EBlockPipelineConfig,
+    identity: &ProverIdentityResponse,
+) -> anyhow::Result<[u8; 32]> {
+    if identity.kind != "identity" {
+        anyhow::bail!(
+            "gen-proof initial response kind was '{}', expected 'identity'",
+            identity.kind
+        );
+    }
+    if identity.network != config.network.as_str() {
+        anyhow::bail!(
+            "SP1 prover network mismatch: expected {}, got {}",
+            config.network.as_str(),
+            identity.network
+        );
+    }
+    validate_prover_elf(
+        config,
+        &identity.block_elf_path,
+        &identity.block_elf_sha256,
+    )
+    .await?;
+    let vk_hash = decode_prover_hash(&identity.vkey_hash, "SP1 program VK hash")?;
+    if vk_hash != config.expected_vk_hash {
+        anyhow::bail!(
+            "SP1 program VK mismatch: expected {}, got {}",
+            hex::encode(config.expected_vk_hash),
+            hex::encode(vk_hash)
+        );
+    }
+    Ok(vk_hash)
+}
+
+async fn validate_prover_elf(
+    config: &E2EBlockPipelineConfig,
+    prover_elf_path: &str,
+    prover_elf_sha256: &str,
+) -> anyhow::Result<()> {
+    let prover_elf_path = PathBuf::from(prover_elf_path);
+    let configured_elf_path = std::fs::canonicalize(&config.block_elf_path)?;
+    let embedded_elf_path = std::fs::canonicalize(&prover_elf_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to resolve gen-proof embedded ELF path {}: {error}",
+            prover_elf_path.display()
+        )
+    })?;
+    if embedded_elf_path != configured_elf_path {
+        anyhow::bail!(
+            "SP1 ELF path mismatch: gen-proof embeds {}, pipeline configured {}",
+            embedded_elf_path.display(),
+            configured_elf_path.display()
+        );
+    }
+    let configured_elf = tokio::fs::read(&configured_elf_path).await?;
+    let configured_elf_sha256 = sha256_hex(&configured_elf);
+    if prover_elf_sha256 != configured_elf_sha256 {
+        anyhow::bail!(
+            "SP1 ELF hash mismatch: gen-proof embeds {prover_elf_sha256}, configured ELF is {configured_elf_sha256}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_proof_response(
+    config: &E2EBlockPipelineConfig,
+    identity_vk_hash: [u8; 32],
+    response: &ProverProofResponse,
+) -> anyhow::Result<()> {
+    if response.network.as_deref() != Some(config.network.as_str()) {
+        anyhow::bail!(
+            "gen-proof response network {:?} did not match {}",
+            response.network,
+            config.network.as_str()
+        );
+    }
+    let block_elf_path = response
+        .block_elf_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("gen-proof response omitted block_elf_path"))?;
+    let response_elf_path = std::fs::canonicalize(block_elf_path)?;
+    let configured_elf_path = std::fs::canonicalize(&config.block_elf_path)?;
+    if response_elf_path != configured_elf_path {
+        anyhow::bail!("gen-proof response block_elf_path changed after identity validation");
+    }
+    let configured_elf = std::fs::read(&configured_elf_path)?;
+    let configured_elf_sha256 = sha256_hex(&configured_elf);
+    if response.block_elf_sha256.as_deref() != Some(configured_elf_sha256.as_str()) {
+        anyhow::bail!("gen-proof response block_elf_sha256 changed after identity validation");
+    }
+    let response_vk_hash = decode_prover_hash(
+        response
+            .vkey_hash
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("gen-proof response omitted vkey_hash"))?,
+        "SP1 response VK hash",
+    )?;
+    if response_vk_hash != identity_vk_hash || response_vk_hash != config.expected_vk_hash {
+        anyhow::bail!("gen-proof response VK hash changed after identity validation");
+    }
+    if response.proof_path.as_deref() != Some(PROOF_PATH) {
+        anyhow::bail!("gen-proof response proof_path was not {PROOF_PATH}");
+    }
+    if response.public_values_path.as_deref() != Some(PUBLIC_VALUES_PATH) {
+        anyhow::bail!("gen-proof response public_values_path was not {PUBLIC_VALUES_PATH}");
+    }
+    Ok(())
+}
+
+fn decode_required_response_bytes(value: Option<&str>, name: &str) -> anyhow::Result<Vec<u8>> {
+    let value = value.ok_or_else(|| anyhow::anyhow!("gen-proof response omitted {name}"))?;
+    hex::decode(value).map_err(|error| anyhow::anyhow!("invalid gen-proof {name} hex: {error}"))
+}
+
+fn decode_prover_hash(value: &str, name: &str) -> anyhow::Result<[u8; 32]> {
+    decode_fixed::<32>(value.strip_prefix("0x").unwrap_or(value), name)
+}
+
 
 async fn persist_evidence(
     config: &E2EBlockPipelineConfig,
@@ -1832,6 +2414,15 @@ fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
     if config.expected_vk_hash.iter().all(|byte| *byte == 0) {
         anyhow::bail!("expected SP1 program VK hash must be non-zero");
     }
+    let profile_vk_hash = config.network.default_vk_hash();
+    if config.expected_vk_hash != profile_vk_hash {
+        anyhow::bail!(
+            "{} profile requires SP1 block VK {}, got {}",
+            config.network.as_str(),
+            hex::encode(profile_vk_hash),
+            hex::encode(config.expected_vk_hash)
+        );
+    }
     if config.sender_bearer_token.trim().is_empty() {
         anyhow::bail!("sender bearer token is required");
     }
@@ -2038,6 +2629,136 @@ mod tests {
         }
     }
 
+    #[test]
+    fn network_profiles_select_distinct_guests_and_vks() {
+        assert_eq!(
+            DogeNetworkProfile::Regtest.default_vk_hash(),
+            REGTEST_BLOCK_VK_HASH
+        );
+        assert_eq!(
+            DogeNetworkProfile::Testnet.default_vk_hash(),
+            TESTNET_BLOCK_VK_HASH
+        );
+        assert_ne!(REGTEST_BLOCK_VK_HASH, TESTNET_BLOCK_VK_HASH);
+        assert!(DogeNetworkProfile::Regtest
+            .default_block_elf_path()
+            .ends_with("block-transition"));
+        assert!(DogeNetworkProfile::Testnet
+            .default_block_elf_path()
+            .ends_with("block-transition-testnet"));
+    }
+
+    #[test]
+    fn high_checkpoint_frontier_advances_without_full_history() {
+        let height = 67_765_166;
+        let checkpoint = empty_checkpoint(height);
+        let next = height + 1;
+        let siblings = sequential_next_leaf_siblings(
+            &checkpoint.txo_block_frontier,
+            next,
+            TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+            TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+            "TXO block frontier",
+        )
+        .unwrap();
+        assert_eq!(siblings.len(), TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH);
+        assert_eq!(checkpoint.txo_block_frontier.index + 1, next);
+    }
+
+
+    #[tokio::test]
+    #[ignore = "live QED Dogecoin testnet check"]
+    async fn qed_testnet_block_constructs_real_guest_input() {
+        const ELECTRS_URL: &str = "https://doge-electrs-testnet-demo.qed.me";
+        const CHECKPOINT_HEIGHT: u32 = 67_765_166;
+        const BLOCK_HEIGHT: u32 = CHECKPOINT_HEIGHT + 1;
+
+        let rpc = DogeLinkElectrsAsyncClient::new(ELECTRS_URL.to_owned());
+        let first = CHECKPOINT_HEIGHT + 1 - PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE as u32;
+        let headers: [QDogeBlockHeader; PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE] = rpc
+            .get_qd_block_headers_range_parallel(first, CHECKPOINT_HEIGHT)
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let state = PsyDogeBridgeState::from_init_data(
+            &InitBlockDataIBC::new_from_block_headers_empty_tree(&headers, CHECKPOINT_HEIGHT),
+        );
+        let claim_siblings: [QHash256; AUTO_CLAIM_DEPOSITS_TREE_HEIGHT] =
+            core::array::from_fn(|level| SHA256_ZERO_HASHES[level]);
+        let txo_siblings: [QHash256; TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH] =
+            core::array::from_fn(|level| {
+                SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT + level]
+            });
+        let checkpoint = PipelineCheckpoint {
+            height: CHECKPOINT_HEIGHT,
+            state_hex: hex::encode(borsh::to_vec(&state).unwrap()),
+            header_hex: hex::encode([0u8; HEADER_SIZE]),
+            claim_frontier: MerkleFrontier::new(0, SHA256_ZERO_HASHES[0], &claim_siblings),
+            txo_block_frontier: MerkleFrontier::new(
+                CHECKPOINT_HEIGHT,
+                SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT],
+                &txo_siblings,
+            ),
+            claim_history: Vec::new(),
+            txo_block_history: Vec::new(),
+            pending_finalization: BTreeMap::new(),
+        };
+        let block = rpc.get_qd_block(BLOCK_HEIGHT).await.unwrap();
+        assert_eq!(
+            block.header.previous_block_hash,
+            state.get_tip_block_hash()
+        );
+        let witness = build_deposit_claim_witness(
+            &block,
+            &checkpoint,
+            &CUSTODY_SCRIPT_CONFIG,
+            &[RECIPIENT_ATA],
+        )
+        .unwrap();
+        let witness_bytes = witness.write_to_vec().unwrap();
+        let old_state_bytes = borsh::to_vec(&state).unwrap();
+        let mut verified_state = state;
+        prover_guest_verify_block_transition_detailed::<DogeTestNetConfig>(
+            CUSTODY_SCRIPT_CONFIG,
+            1,
+            witness,
+            &mut verified_state,
+            0,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(verified_state.get_tip_block_number(), BLOCK_HEIGHT);
+
+        let root = PathBuf::from("/tmp/psy-doge-qed-block-input-67765167");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("old_state.bin"), &old_state_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("witness.bin"), &witness_bytes)
+            .await
+            .unwrap();
+        let manifest = serde_json::json!({
+            "network": "testnet",
+            "electrs_url": ELECTRS_URL,
+            "checkpoint_height": CHECKPOINT_HEIGHT,
+            "block_height": BLOCK_HEIGHT,
+            "block_hash": hex::encode(block.header.get_hash()),
+            "old_state_size": old_state_bytes.len(),
+            "old_state_sha256": sha256_hex(&old_state_bytes),
+            "witness_size": witness_bytes.len(),
+            "witness_sha256": sha256_hex(&witness_bytes),
+            "guest_input_verified": true,
+        });
+        tokio::fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+        println!("{}", serde_json::to_string(&manifest).unwrap());
+    }
     #[test]
     fn manager_custody_deposit_advances_auto_claim_and_mint_commitments() {
         let height = 101;

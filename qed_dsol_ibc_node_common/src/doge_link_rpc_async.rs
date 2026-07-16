@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::{block::{Header, SimpleHeader}, hashes::Hash, Block};
 use doge_light_client::{common_types::QHash256, core_data::{QAuxPow, QDogeBlock, QDogeBlockHeader, QMerkleBranch, QStandardBlockHeader}, doge::{coinbase_transaction::DogeAuxPowCoinbaseTransaction, transaction::BTCTransaction}};
 use futures::future;
@@ -38,7 +39,12 @@ impl DogeLinkElectrsAsyncClient {
     }
 
     pub async fn get_block_height(&self) -> anyhow::Result<u32> {
-        let height: u32 = self.get_json::<u32>("blocks/tip/height").await?;
+        // QED's public edge can cache this dynamic endpoint independently of
+        // block/status responses. A unique query forces the current tip.
+        let cache_bust = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let height: u32 = self
+            .get_json::<u32>(&format!("blocks/tip/height?fresh={cache_bust}"))
+            .await?;
         Ok(height)
     }
     pub async fn get_block_qhash(&self, height: u32) -> anyhow::Result<QHash256> {

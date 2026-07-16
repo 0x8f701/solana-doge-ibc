@@ -84,6 +84,7 @@ type Options = {
     fundingVout?: number;
     fundingAmount?: number;
     fullE2eFundingArtifact?: string;
+    externalFundingArtifact?: string;
     recipientTokenAccount?: string;
     requestIndex?: number;
 };
@@ -145,6 +146,10 @@ const FULL_E2E_FUNDING_SCHEMA = "psy-doge-full-e2e-funding-v1";
 const FULL_E2E_FUNDING_BLOCKS = 110;
 const FULL_E2E_MIN_CONFIRMATIONS = 100;
 const FULL_E2E_MIN_VALUE_SATS = 101_000_000;
+const TESTNET_FUNDING_SCHEMA = "psy-doge-qed-testnet-funding-v1";
+const TESTNET_P2PKH_VERSION = 0x71;
+const REGTEST_P2PKH_VERSION = 0x6f;
+const SHARED_P2SH_VERSION = 0xc4;
 const PORTS = {
     dogeRpc: 22555,
     dogeP2p: 18444,
@@ -163,7 +168,7 @@ Doge local bridge launcher and public Solana deployer (Bun)
 
 Usage:
   bun integration/e2e/locSetupDoge.ts [local options]
-  bun integration/e2e/locSetupDoge.ts --profile testnet [--full] [--dogecoind]
+  bun integration/e2e/locSetupDoge.ts --profile testnet [--full] [--external-funding-artifact <path>]
   bun integration/e2e/locSetupDoge.ts --deposit --funding-wif <WIF> --funding-txid <hash> --funding-vout <n> --funding-amount <sats> --recipient-token-account <pubkey>
   bun integration/e2e/locSetupDoge.ts --withdraw --request-index <n>
   bun integration/e2e/locSetupDoge.ts --deploy --cluster devnet --rpc-url <url> --payer <keypair> --program-key-dir <dir> --preflight
@@ -173,7 +178,7 @@ Profiles (local orchestration):
   --profile initialized-noop  real-noop plus bridge initialization and three local users
   --profile wormhole          Official pinned Wormhole Guardian + Solana devnet via Tilt/Kubernetes
   --profile legacy-ibc        Isolated Redis sandbox only; visibly dummy/incompatible, no legacy workers
-  --profile testnet           QED Dogecoin testnet electrs + local Solana programs/init/users; no local dogecoind by default
+  --profile testnet           Hybrid: QED public Dogecoin testnet Electrs + local Solana/noop Manager; no local dogecoind/electrs/mining
   --full                      With testnet, also start block sender, IBC pipeline, and manager service
 
 Public deployment (custom programs only; canonical Wormhole programs are never deployed):
@@ -222,6 +227,9 @@ Local components and lifecycle:
   --prepare-full-e2e-funding <path>
                               Before checkpoint generation/init, mine 110 blocks to a fresh address,
                               wait for Electrs, select a mature UTXO, and atomically write a mode-600 artifact
+  --external-funding-artifact <path>
+                              Hybrid testnet only: read externally funded UTXO metadata (no WIF). WIF is loaded
+                              only from walletPath inside that artifact, never written to evidence/repo.
   --only <csv>                Replace profile components (including the three services above)
   --teardown                  Stop only launcher-recorded PIDs/container IDs
   --purge                     Teardown and remove launcher-owned state
@@ -250,7 +258,7 @@ Examples:
   bun integration/e2e/locSetupDoge.ts --preflight
   bun integration/e2e/locSetupDoge.ts --profile initialized-noop
   bun integration/e2e/locSetupDoge.ts --profile testnet --preflight
-  bun integration/e2e/locSetupDoge.ts --profile testnet --full
+  bun integration/e2e/locSetupDoge.ts --profile testnet --full --external-funding-artifact /tmp/psy-doge-qed-funding.json
   bun integration/e2e/locSetupDoge.ts --profile testnet --dogecoind
   bun integration/e2e/locSetupDoge.ts --profile wormhole --preflight
   bun integration/e2e/locSetupDoge.ts --deploy --cluster devnet --rpc-url https://api.devnet.solana.com \
@@ -364,6 +372,8 @@ function resolveOptions(): Options | null {
             "no-solana": { type: "boolean" },
             initialize: { type: "boolean" },
             "create-users": { type: "boolean" },
+            "prepare-full-e2e-funding": { type: "string" },
+            "external-funding-artifact": { type: "string" },
             "noop-monitor": { type: "boolean" },
             "legacy-ibc": { type: "boolean" },
             "block-sender": { type: "boolean" },
@@ -371,7 +381,6 @@ function resolveOptions(): Options | null {
             "manager-service": { type: "boolean" },
             dogecoind: { type: "boolean" },
             full: { type: "boolean" },
-            "prepare-full-e2e-funding": { type: "string" },
             deposit: { type: "boolean" },
             withdraw: { type: "boolean" },
             "funding-wif": { type: "string" },
@@ -410,10 +419,21 @@ function resolveOptions(): Options | null {
         fail("--prepare-full-e2e-funding requires a non-empty artifact path.");
     }
     const fullE2eFundingArtifact = fullE2eFundingRaw === undefined ? undefined : path.resolve(String(fullE2eFundingRaw));
+    const externalFundingRaw = values["external-funding-artifact"];
+    if (externalFundingRaw !== undefined && String(externalFundingRaw).trim().length === 0) {
+        fail("--external-funding-artifact requires a non-empty artifact path.");
+    }
+    const externalFundingArtifact = externalFundingRaw === undefined ? undefined : path.resolve(String(externalFundingRaw));
+    if (fullE2eFundingArtifact && externalFundingArtifact) {
+        fail("Use only one of --prepare-full-e2e-funding and --external-funding-artifact.");
+    }
+    if (externalFundingArtifact && profile !== "testnet") {
+        fail("--external-funding-artifact is only supported with --profile testnet.");
+    }
     const bridgeRepo = path.resolve(asString(values["bridge-repo"], path.join(projectsDir, "psy-doge-solana-bridge")));
     let deploy: DeploymentOptions | undefined;
     if (values.deploy) {
-        if (values.teardown || values.purge || values.only || values.profile || values.deposit || values.withdraw || fullE2eFundingArtifact) fail("--deploy cannot be combined with local profile/lifecycle/operator selection.");
+        if (values.teardown || values.purge || values.only || values.profile || values.deposit || values.withdraw || fullE2eFundingArtifact || externalFundingArtifact) fail("--deploy cannot be combined with local profile/lifecycle/operator selection.");
         const cluster = parseDeploymentCluster(values.cluster);
         const payerKeypair = path.resolve(asString(values.payer, ""));
         if (!values.payer) fail("--deploy requires --payer <keypair path>.");
@@ -516,6 +536,10 @@ function resolveOptions(): Options | null {
         components.add("dogecoin");
         components.add("electrs");
     }
+    if (profile === "testnet" && !values.dogecoind && !values.dogecoin && !values.electrs) {
+        components.delete("dogecoin");
+        components.delete("electrs");
+    }
     if (components.has("electrs")) components.add("dogecoin");
     if (components.has("users")) components.add("initialize");
     if (components.has("initialize")) components.add("solana");
@@ -524,11 +548,12 @@ function resolveOptions(): Options | null {
     if (components.has("block-sender")) components.add("initialize");
     if (components.has("initialize")) components.add("solana");
     if (fullE2eFundingArtifact && !components.has("initialize")) fail("--prepare-full-e2e-funding requires --initialize (or a profile/component set that initializes the bridge).");
+    if (externalFundingArtifact && !components.has("initialize")) fail("--external-funding-artifact requires --initialize (or a profile/component set that initializes the bridge).");
 
     const deposit = Boolean(values.deposit || components.has("deposit"));
     const withdraw = Boolean(values.withdraw || components.has("withdraw"));
     if (deposit && withdraw) fail("Use only one of --deposit and --withdraw.");
-    if ((deposit || withdraw) && (values.teardown || values.purge || values.deploy || fullE2eFundingArtifact)) fail("Operator modes cannot be combined with --deploy, --teardown, --purge, or --prepare-full-e2e-funding.");
+    if ((deposit || withdraw) && (values.teardown || values.purge || values.deploy || fullE2eFundingArtifact || externalFundingArtifact)) fail("Operator modes cannot be combined with --deploy, --teardown, --purge, --prepare-full-e2e-funding, or --external-funding-artifact.");
     const fundingVout = parseIntegerOption(values["funding-vout"], "--funding-vout", 0);
     const fundingAmount = parseIntegerOption(values["funding-amount"], "--funding-amount", 1);
     const requestIndex = parseIntegerOption(values["request-index"], "--request-index", 0);
@@ -574,6 +599,7 @@ function resolveOptions(): Options | null {
         fundingVout,
         fundingAmount,
         fullE2eFundingArtifact,
+        externalFundingArtifact,
         recipientTokenAccount: values["recipient-token-account"] ? String(values["recipient-token-account"]) : undefined,
         requestIndex,
     };
@@ -761,14 +787,30 @@ async function solanaHealthy(): Promise<boolean> {
     }
 }
 
-async function electrsHeight(): Promise<number | null> {
+async function electrsHeight(baseUrl: string = ELECTRS_HTTP_URL): Promise<number | null> {
     try {
-        const response = await fetch(`${ELECTRS_HTTP_URL}/blocks/tip/height`, { signal: AbortSignal.timeout(2_000) });
+        const response = await fetch(`${baseUrl.replace(/\/$/, "")}/blocks/tip/height`, { signal: AbortSignal.timeout(10_000) });
         if (!response.ok) return null;
         const height = Number.parseInt((await response.text()).trim(), 10);
         return Number.isFinite(height) ? height : null;
     } catch {
         return null;
+    }
+}
+
+async function electrsText(baseUrl: string, route: string): Promise<string> {
+    const url = `${baseUrl.replace(/\/$/, "")}${route.startsWith("/") ? route : `/${route}`}`;
+    const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) fail(`Electrs ${url} returned ${response.status}: ${await response.text()}`);
+    return (await response.text()).trim();
+}
+
+async function electrsJson(baseUrl: string, route: string): Promise<unknown> {
+    const text = await electrsText(baseUrl, route);
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        fail(`Electrs ${route} returned non-JSON: ${String(error)}`);
     }
 }
 
@@ -787,14 +829,16 @@ function fundingP2pkhScriptHash(address: string): string {
     const first = createHash("sha256").update(body).digest();
     const expected = createHash("sha256").update(first).digest().subarray(0, 4);
     if (!Buffer.from(checksum).equals(expected)) fail(`Funding address ${address} has an invalid Base58Check checksum.`);
-    if (decoded[0] !== 0x6f) fail(`Funding address ${address} is not regtest/testnet P2PKH.`);
+    if (decoded[0] !== REGTEST_P2PKH_VERSION && decoded[0] !== TESTNET_P2PKH_VERSION) {
+        fail(`Funding address ${address} is not regtest/testnet P2PKH (version 0x${decoded[0].toString(16)}).`);
+    }
     const script = Buffer.concat([Buffer.from([0x76, 0xa9, 0x14]), Buffer.from(decoded.slice(1, 21)), Buffer.from([0x88, 0xac])]);
     return createHash("sha256").update(script).digest("hex");
 }
 
-async function fundingUtxos(address: string): Promise<FundingUtxo[]> {
+async function fundingUtxos(address: string, electrsBaseUrl: string = ELECTRS_HTTP_URL): Promise<FundingUtxo[]> {
     const scriptHash = fundingP2pkhScriptHash(address);
-    const response = await fetch(`${ELECTRS_HTTP_URL}/scripthash/${scriptHash}/utxo`, { signal: AbortSignal.timeout(5_000) });
+    const response = await fetch(`${electrsBaseUrl.replace(/\/$/, "")}/scripthash/${scriptHash}/utxo`, { signal: AbortSignal.timeout(15_000) });
     if (!response.ok) fail(`Electrs funding UTXO query returned ${response.status}: ${await response.text()}`);
     const value: unknown = await response.json();
     if (!Array.isArray(value)) fail("Electrs funding UTXO response must be an array.");
@@ -1019,19 +1063,38 @@ class Launcher {
     }
 
     bridgeBuildCommands(): string[][] {
+        // BridgeTestnetVk: workspace post-processing breaks with `cargo build-sbf -- -p ...`.
+        // Prefer package-scoped --manifest-path for doge-bridge and space-separated features.
         if (this.options.deploy) {
             return [
-                ["cargo", "build-sbf", "--", "--no-default-features", "--features", "solprogram,wormhole", "-p", "doge-bridge"],
-                ["cargo", "build-sbf", "--", "--no-default-features", "--features", "solprogram", "-p", "manual-claim"],
-                ["cargo", "build-sbf", "--", "--no-default-features", "-p", "pending-mint-buffer", "-p", "txo-buffer", "-p", "generic-buffer"],
+                [
+                    "cargo", "build-sbf",
+                    "--manifest-path", "programs/doge-bridge/Cargo.toml",
+                    "--no-default-features",
+                    "--features", "solprogram", "wormhole", "testnet-vk",
+                ],
+                ["cargo", "build-sbf", "--manifest-path", "programs/manual-claim/Cargo.toml", "--no-default-features", "--features", "solprogram"],
+                ["cargo", "build-sbf", "--manifest-path", "programs/pending-mint-buffer/Cargo.toml", "--no-default-features"],
+                ["cargo", "build-sbf", "--manifest-path", "programs/txo-buffer/Cargo.toml", "--no-default-features"],
+                ["cargo", "build-sbf", "--manifest-path", "programs/generic-buffer/Cargo.toml", "--no-default-features"],
             ];
         }
         const shimFeature = this.options.profile === "wormhole" ? "wormhole" : "noopshim";
+        // Exactly one network VK feature for non-mock doge-bridge.
+        const networkVkFeature = this.isHybridTestnet() ? "testnet-vk" : "regtest-vk";
         return [
-            ["cargo", "build-sbf", "--", "--no-default-features", "--features", `solprogram,${shimFeature}`, "-p", "doge-bridge"],
-            ["cargo", "build-sbf", "--", "--no-default-features", "--features", "solprogram", "-p", "manual-claim"],
-            ["cargo", "build-sbf", "--", "--no-default-features", "-p", "pending-mint-buffer", "-p", "txo-buffer", "-p", "generic-buffer", "-p", "noop-shim"],
-            ["cargo", "build-sbf", "--", "--no-default-features", "-p", "delegated-manager-set"],
+            [
+                "cargo", "build-sbf",
+                "--manifest-path", "programs/doge-bridge/Cargo.toml",
+                "--no-default-features",
+                "--features", "solprogram", shimFeature, networkVkFeature,
+            ],
+            ["cargo", "build-sbf", "--manifest-path", "programs/manual-claim/Cargo.toml", "--no-default-features", "--features", "solprogram"],
+            ["cargo", "build-sbf", "--manifest-path", "programs/pending-mint-buffer/Cargo.toml", "--no-default-features"],
+            ["cargo", "build-sbf", "--manifest-path", "programs/txo-buffer/Cargo.toml", "--no-default-features"],
+            ["cargo", "build-sbf", "--manifest-path", "programs/generic-buffer/Cargo.toml", "--no-default-features"],
+            ["cargo", "build-sbf", "--manifest-path", "programs/noop-shim/Cargo.toml", "--no-default-features"],
+            ["cargo", "build-sbf", "--manifest-path", "programs/delegated-manager-set/Cargo.toml", "--no-default-features"],
         ];
     }
 
@@ -1520,6 +1583,14 @@ class Launcher {
             console.log(`  (prepare full E2E funding) getnewaddress; generatetoaddress ${FULL_E2E_FUNDING_BLOCKS}; wait for Electrs tip equality; write mode-600 ${this.options.fullE2eFundingArtifact}`);
             console.log("  (ordering) funding preparation completes before dynamic checkpoint generation and bridge initialization");
         }
+        if (this.options.externalFundingArtifact) {
+            console.log(`  (external QED funding) read ${this.options.externalFundingArtifact}; load WIF only from walletPath; never log secrets`);
+            console.log("  (ordering) external funding validated before dynamic QED tip checkpoint and bridge initialization");
+        }
+        if (this.options.profile === "testnet" && !this.options.dogecoind) {
+            console.log(`  (remote) QED Electrs ${TESTNET_ELECTRS_URL} tip/height + block-height/{H-1}; no local dogecoind/electrs/mining`);
+            console.log("  (checkpoint) generate bridge init config from QED tip-1 via generate_regtest_init (Electrs-only hash)");
+        }
         if (c.has("solana")) {
             if (missingElfs.length > 0 || this.options.rebuildPrograms) for (const command of this.bridgeBuildCommands()) console.log(`  (real build) ${commandText(command)}`);
             console.log(`  ${solanaRunning ? "(reuse)" : "(start)"} ${commandText(this.solanaCommand())}`);
@@ -1531,7 +1602,10 @@ class Launcher {
         if (c.has("initialize")) console.log("  (one-shot) doge-bridge-cli initialize-from-doge-data --airdrop --yes");
         if (c.has("users")) console.log("  (one-shot) doge-bridge-cli create-user x3 (missing user files only)");
         if (c.has("block-sender")) console.log(`  (start) node dist/index.js on 127.0.0.1:${BLOCK_SENDER_PORT}`);
-        if (c.has("ibc-pipeline")) console.log(`  (start) cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- --electrs-url ${this.electrsUrl()} ...`);
+        if (c.has("ibc-pipeline")) {
+            const networkFlag = this.options.profile === "testnet" && !this.options.dogecoind ? " --network testnet" : "";
+            console.log(`  (start) cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- --electrs-url ${this.electrsUrl()}${networkFlag} ...`);
+        }
         if (c.has("manager-service")) console.log(`  (start) ${this.localOpsBinary("local_manager_service")} --listen 127.0.0.1:${MANAGER_SERVICE_PORT}`);
         if (c.has("noop-monitor")) console.log(`  (start) noop_shim_monitor ${SOLANA_RPC_URL} ${BRIDGE_STATE_PDA}`);
         if (c.has("legacy-ibc")) console.log("  (isolated dummy sandbox) docker run --rm -p 127.0.0.1:6379:6379 redis:7-alpine");
@@ -1786,7 +1860,7 @@ class Launcher {
         const cli = path.join(this.options.bridgeRepo, "target/release/doge-bridge-cli");
         if (!firstExecutable([cli])) {
             if (this.options.noBuild) fail(`Missing bridge CLI and --no-build was set: ${cli}`);
-            await this.run(["cargo", "build", "--release", "-p", "doge-bridge-cli"], "build-bridge-cli", this.options.bridgeRepo);
+            await this.run(["cargo", "build", "--release", "-p", "doge-bridge-cli", "--bin", "doge-bridge-cli"], "build-bridge-cli", this.options.bridgeRepo);
         }
         if (!firstExecutable([cli])) fail(`Bridge CLI build did not produce ${cli}`);
         return cli;
@@ -1890,6 +1964,116 @@ class Launcher {
         return this.bridgeCheckpoint;
     }
 
+    isHybridTestnet(): boolean {
+        return this.options.profile === "testnet" && !this.options.dogecoind;
+    }
+
+    dogeNetworkName(): "regtest" | "testnet" {
+        return this.isHybridTestnet() ? "testnet" : "regtest";
+    }
+
+    async generateTestnetBridgeConfig(): Promise<{ configPath: string; height: number; hash: string }> {
+        const generator = this.localOpsBinary("generate_regtest_init");
+        if (!firstExecutable([generator])) {
+            if (this.options.noBuild) fail(`Missing init generator and --no-build was set: ${generator}`);
+            await this.run(["cargo", "build", "--release", "--bin", "generate_regtest_init"], "build-regtest-init-generator", this.localOpsRoot());
+        }
+        const electrs = this.electrsUrl();
+        const tipHeight = await electrsHeight(electrs);
+        if (tipHeight === null || tipHeight < 32) fail(`Cannot generate QED testnet checkpoint: Electrs tip=${tipHeight}`);
+        const checkpointOverride = process.env.DOGE_TESTNET_CHECKPOINT_HEIGHT;
+        const checkpointHeight = checkpointOverride === undefined
+            ? tipHeight - 1
+            : Number(checkpointOverride);
+        if (!Number.isInteger(checkpointHeight) || checkpointHeight < 1 || checkpointHeight >= tipHeight) {
+            fail(`DOGE_TESTNET_CHECKPOINT_HEIGHT must be an integer below tip ${tipHeight}, got '${checkpointOverride}'`);
+        }
+        // Checkpoint hash comes only from QED Electrs /block-height/{H}; dogecoind is never consulted.
+        const checkpointHash = (await electrsText(electrs, `block-height/${checkpointHeight}`)).toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(checkpointHash)) fail(`Invalid Electrs checkpoint hash at height ${checkpointHeight}: ${checkpointHash}`);
+        const status = await electrsJson(electrs, `block/${checkpointHash}/status`) as { in_best_chain?: boolean; height?: number };
+        if (!status?.in_best_chain || status.height !== checkpointHeight) {
+            fail(`Electrs checkpoint ${checkpointHash} is not best-chain height ${checkpointHeight}: ${JSON.stringify(status)}`);
+        }
+        const configPath = path.join(this.runDir, "doge-testnet-init.json");
+        const templatePath = path.join(this.options.bridgeRepo, "bridge-config", "doge_config.json");
+        const custodyScriptConfig = Buffer.from(bs58.decode(BRIDGE_STATE_PDA)).toString("hex");
+        // Required: generator must select DogeNetworkType::TestNet (DogeTestNetConfig family).
+        await this.run([
+            generator,
+            "--network", "testnet",
+            "--template", templatePath,
+            "--output", configPath,
+            "--electrs-url", electrs,
+            "--checkpoint-height", String(checkpointHeight),
+            "--required-confirmations", "1",
+            "--custody-script-config", custodyScriptConfig,
+            "--expected-block-hash", checkpointHash,
+        ], "generate-testnet-init", this.localOpsRoot());
+        this.bridgeCheckpoint = { configPath, height: checkpointHeight, hash: checkpointHash };
+        console.log(`[checkpoint:testnet] DogeNetworkType::TestNet height=${checkpointHeight} hash=${checkpointHash} electrs=${electrs}`);
+        return this.bridgeCheckpoint;
+    }
+
+    async loadExternalTestnetFunding(): Promise<{
+        address: string;
+        wif: string;
+        txid: string;
+        vout: number;
+        value: number;
+        blockHeight: number;
+        electrsTipHeight: number;
+        walletPath: string;
+        electrsUrl: string;
+    }> {
+        const artifactPath = this.options.externalFundingArtifact;
+        if (!artifactPath) fail("loadExternalTestnetFunding requires --external-funding-artifact");
+        if (!fs.existsSync(artifactPath)) fail(`External funding artifact missing: ${artifactPath}`);
+        const mode = fs.statSync(artifactPath).mode & 0o777;
+        if (mode !== 0o600 && mode !== 0o644 && mode !== 0o664) {
+            console.warn(`[funding] artifact mode ${mode.toString(8)} is not 600; continuing without printing secrets`);
+        }
+        const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8")) as Record<string, unknown>;
+        // Accept exact Main format without schema field; never require secrets in artifact.
+        const network = String(artifact.network || "");
+        if (network !== "dogecoin-testnet" && network !== "testnet") {
+            fail(`External funding network must be dogecoin-testnet/testnet, got '${network}'`);
+        }
+        const electrsUrl = String(artifact.electrsUrl || TESTNET_ELECTRS_URL);
+        const address = String(artifact.address || "");
+        const txid = String(artifact.txid || "");
+        const vout = Number(artifact.vout);
+        const value = Number(artifact.value);
+        const blockHeight = Number(artifact.blockHeight);
+        const walletPath = path.resolve(String(artifact.walletPath || ""));
+        if (!address || !/^[0-9a-f]{64}$/i.test(txid) || !Number.isInteger(vout) || vout < 0 || !Number.isSafeInteger(value) || value <= 0 || !Number.isInteger(blockHeight) || blockHeight < 0) {
+            fail(`External funding artifact ${artifactPath} is missing required address/txid/vout/value/blockHeight fields`);
+        }
+        if (!walletPath || !fs.existsSync(walletPath)) fail(`External funding walletPath missing: ${walletPath || "(empty)"}`);
+        const walletMode = fs.statSync(walletPath).mode & 0o777;
+        if (walletMode !== 0o600) fail(`External funding wallet ${walletPath} must have mode 600, got ${walletMode.toString(8)}`);
+        fundingP2pkhScriptHash(address);
+        const wallet = JSON.parse(fs.readFileSync(walletPath, "utf8")) as Record<string, unknown>;
+        const wif = String(wallet.privateKeyWIF || wallet.wif || "");
+        if (!wif) fail(`Wallet ${walletPath} does not contain privateKeyWIF`);
+        if (typeof wallet.address === "string" && wallet.address !== address) {
+            fail(`Wallet address ${wallet.address} does not match funding artifact address ${address}`);
+        }
+        const tip = await electrsHeight(electrsUrl);
+        if (tip === null) fail(`Unable to read QED Electrs tip from ${electrsUrl}`);
+        const utxos = await fundingUtxos(address, electrsUrl);
+        const match = utxos.find((utxo) => utxo.txid.toLowerCase() === txid.toLowerCase() && utxo.vout === vout);
+        const allowSpent = process.env.ALLOW_SPENT_TESTNET_FUNDING === "1";
+        if (!match && !allowSpent) fail(`Funding outpoint ${txid}:${vout} is not present as an unspent Electrs UTXO for ${address}`);
+        if (match && match.value !== value) fail(`Funding value mismatch: artifact ${value} vs Electrs ${match.value}`);
+        if (match && (!match.status.confirmed || match.status.block_height !== blockHeight)) {
+            fail(`Funding outpoint is not confirmed at expected height ${blockHeight}`);
+        }
+        if (!match) console.log(`[funding:testnet] prior funding outpoint ${txid}:${vout} already spent; continuing because ALLOW_SPENT_TESTNET_FUNDING=1`);
+        // Never log WIF.
+        return { address, wif, txid, vout, value, blockHeight, electrsTipHeight: tip, walletPath, electrsUrl };
+    }
+
     async initializeBridge(createUsers: boolean): Promise<void> {
         const cli = await this.ensureBridgeCli();
         const configDir = path.join(this.options.bridgeRepo, "bridge-config");
@@ -1900,7 +2084,10 @@ class Launcher {
         if (!fs.existsSync(dogeConfig)) fail(`Missing bridge initialization config: ${dogeConfig}`);
         ensureDirectory(keysDir);
         ensureDirectory(usersDir);
-        if (!this.bridgeCheckpoint && this.options.dogecoind) await this.generateRegtestBridgeConfig();
+        if (!this.bridgeCheckpoint) {
+            if (this.options.dogecoind) await this.generateRegtestBridgeConfig();
+            else if (this.isHybridTestnet()) await this.generateTestnetBridgeConfig();
+        }
         const activeDogeConfig = this.bridgeCheckpoint?.configPath ?? dogeConfig;
         if (!(await this.accountExists(BRIDGE_STATE_PDA))) {
             await this.run([
@@ -1938,13 +2125,26 @@ class Launcher {
                 const userOutput = path.join(usersDir, `${name}.json`);
                 const userExists = fs.existsSync(userOutput);
                 if (userExists) {
-                    const user = JSON.parse(fs.readFileSync(userOutput, "utf8")) as { doge_ata?: string };
+                    const user = JSON.parse(fs.readFileSync(userOutput, "utf8")) as { doge_ata?: string; private_key?: number[] };
                     if (user.doge_ata && await this.accountExists(user.doge_ata)) {
                         console.log(`[reuse:user] ${userOutput}`);
                         continue;
                     }
-                    console.log(`[repair:user] Recreating missing ATA from ${userOutput}`);
-                    fs.rmSync(userOutput);
+                    if (!Array.isArray(user.private_key) || user.private_key.length !== 64) {
+                        fail(`Cannot repair ${userOutput}: expected a 64-byte private_key array`);
+                    }
+                    const userKeypair = path.join(this.runDir, `${name}-keypair.json`);
+                    fs.writeFileSync(userKeypair, JSON.stringify(user.private_key), { mode: 0o600 });
+                    await this.run([
+                        cli, "--rpc-url", SOLANA_RPC_URL,
+                        "-k", payer,
+                        "create-user",
+                        "--doge-mint", bridgeOutput.doge_mint,
+                        "--output", userOutput,
+                        "--user-keypair", userKeypair,
+                    ], `repair-${name}`, this.options.bridgeRepo);
+                    console.log(`[repair:user] Recreated ATA while preserving ${name} identity`);
+                    continue;
                 }
                 await this.run([
                     cli, "--rpc-url", SOLANA_RPC_URL,
@@ -2143,7 +2343,14 @@ class Launcher {
         const ibcDir = path.join(this.options.projectsDir, "solana-doge-ibc");
         const electrsUrl = this.electrsUrl();
         const bridgeArgs = await this.prepareBlockPipelineConfig();
-        await this.spawn([
+        const networkArgs = this.isHybridTestnet() ? ["--network", "testnet"] : [];
+        const blockElfDefault = this.isHybridTestnet()
+            ? path.join(this.options.sp1Repo, "target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition-testnet")
+            : path.join(this.options.sp1Repo, "target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition");
+        const blockElfPath = process.env.SP1_BLOCK_ELF_PATH || blockElfDefault;
+        // Current DogeTestNetConfig block-transition VK (hex with optional 0x).
+        const expectedVk = process.env.SP1_BLOCK_VK_HASH || "006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd";
+        const command = [
             "cargo", "run", "--release", "-p", "qed_dsol_ibc_node_common",
             "--example", "e2e_block_pipeline", "--",
             "--electrs-url", electrsUrl,
@@ -2152,9 +2359,17 @@ class Launcher {
             "--sender-token", BLOCK_SENDER_API_TOKEN,
             "--gen-proof-path", path.join(this.options.sp1Repo, "target/release/gen-proof"),
             "--required-confirmations", "1",
+            ...networkArgs,
             ...bridgeArgs,
-        ], "ibc-pipeline", ibcDir, true, { DOGE_SAVE_PROVER_ARGS: "1" });
-        console.log(`[ready:ibc-pipeline] polling ${electrsUrl}`);
+        ];
+        if (this.isHybridTestnet()) {
+            if (fs.existsSync(blockElfPath)) {
+                command.push("--block-elf-path", blockElfPath);
+            }
+            if (expectedVk) command.push("--expected-vk-hash", expectedVk);
+        }
+        await this.spawn(command, "ibc-pipeline", ibcDir, true, { DOGE_SAVE_PROVER_ARGS: "1" });
+        console.log(`[ready:ibc-pipeline] polling ${electrsUrl}${this.isHybridTestnet() ? " network=testnet" : ""}`);
     }
 
     async startManagerService(): Promise<void> {
@@ -2166,8 +2381,10 @@ class Launcher {
 
     async runDeposit(options: { fundingWif: string; fundingTxid: string; fundingVout: number; fundingAmount: number; recipientTokenAccount: string }): Promise<void> {
         const keys = this.bridgeKeys();
+        const networkArgs = this.isHybridTestnet() ? ["--network", "testnet"] : [];
         await this.run([
             this.localOpsBinary("deposit_to_solana"),
+            ...networkArgs,
             "--funding-wif", options.fundingWif,
             "--funding-txid", options.fundingTxid,
             "--funding-vout", String(options.fundingVout),
@@ -2183,8 +2400,10 @@ class Launcher {
 
     async runWithdrawal(options: { requestIndex: number }): Promise<void> {
         const keys = this.bridgeKeys();
-        await this.run([
+        const hybrid = this.isHybridTestnet();
+        const args = [
             this.localOpsBinary("process_withdrawal"),
+            "--network", hybrid ? "testnet" : "regtest",
             "--request-index", String(options.requestIndex),
             "--operator-keypair", keys.operator,
             "--payer-keypair", keys.payer,
@@ -2192,9 +2411,18 @@ class Launcher {
             "--manager-service-url", `http://127.0.0.1:${MANAGER_SERVICE_PORT}`,
             "--electrs-url", this.electrsUrl(),
             "--wormhole-shim-program", LOCAL_NOOP_SHIM_ID,
+            "--manager-set-index", "0",
             "--manager-signing-enabled",
             "--broadcast-enabled",
-        ], "process-withdrawal", this.localOpsRoot());
+            "--min-confirmations", hybrid ? "6" : "1",
+        ];
+        if (hybrid) {
+            args.push(
+                "--confirmation-timeout-secs", process.env.QED_WITHDRAWAL_TIMEOUT_SECS || "7200",
+                "--poll-interval-ms", process.env.QED_WITHDRAWAL_POLL_MS || "2000",
+            );
+        }
+        await this.run(args, "process-withdrawal", this.localOpsRoot());
     }
 
     async start(): Promise<void> {
@@ -2230,6 +2458,7 @@ class Launcher {
         if (c.has("dogecoin")) await this.startDogecoin(binaries.dogeDaemon!, status.dogeRunning);
         if (c.has("electrs")) await this.startElectrs(binaries.electrs!, status.electrsRunning);
         if (this.options.fullE2eFundingArtifact) await this.prepareFullE2eFunding();
+        if (this.options.externalFundingArtifact) await this.loadExternalTestnetFunding();
         if (c.has("solana")) await this.startSolana(status.solanaRunning);
         if (c.has("initialize")) await this.initializeBridge(c.has("users"));
         if (c.has("noop-monitor")) await this.startNoopMonitor();

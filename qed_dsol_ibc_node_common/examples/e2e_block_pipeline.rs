@@ -7,11 +7,17 @@ use doge_bridge_client::constants::{
     TXO_BUFFER_BUILDER_PROGRAM_ID,
 };
 use solana_sdk::pubkey::Pubkey;
-use qed_dsol_ibc_node_common::e2e_block_pipeline::{E2EBlockPipeline, E2EBlockPipelineConfig};
+use qed_dsol_ibc_node_common::e2e_block_pipeline::{
+    DogeNetworkProfile, E2EBlockPipeline, E2EBlockPipelineConfig,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Poll finalized Dogecoin blocks, prove the current SP1 transition, and submit block_update")]
 struct Args {
+    /// Dogecoin consensus/profile selection. Regtest remains the default.
+    #[arg(long, env = "DOGE_NETWORK", value_enum, default_value_t)]
+    network: DogeNetworkProfile,
+
     /// Electrs HTTP endpoint. The default is the local electrs REST server.
     #[arg(long, env = "DOGE_ELECTRS_URL", default_value = "http://127.0.0.1:3002")]
     electrs_url: String,
@@ -34,21 +40,13 @@ struct Args {
     )]
     gen_proof_path: PathBuf,
 
-    /// Release block-transition guest ELF embedded in gen-proof.
-    #[arg(
-        long,
-        env = "SP1_BLOCK_ELF_PATH",
-        default_value = "../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition"
-    )]
-    block_elf_path: PathBuf,
+    /// Release block-transition guest ELF embedded in gen-proof. Defaults by --network.
+    #[arg(long, env = "SP1_BLOCK_ELF_PATH")]
+    block_elf_path: Option<PathBuf>,
 
-    /// Expected 32-byte per-program SP1 VK hash (the on-chain SINGLE_BLOCK_UPDATE_VK).
-    #[arg(
-        long,
-        env = "SP1_BLOCK_VK_HASH",
-        default_value = "00a46ec348b525eea327ac89a090b17c44dab7e399a1d9fa4668c52cba1ba672"
-    )]
-    expected_vk_hash: String,
+    /// Expected 32-byte per-program SP1 VK hash. Defaults by --network.
+    #[arg(long, env = "SP1_BLOCK_VK_HASH")]
+    expected_vk_hash: Option<String>,
 
     /// Stable root for per-height, content-addressed proof evidence and latest.json.
     #[arg(
@@ -125,14 +123,24 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let block_elf_path = args
+        .block_elf_path
+        .unwrap_or_else(|| args.network.default_block_elf_path());
+    let expected_vk_hash = args
+        .expected_vk_hash
+        .as_deref()
+        .map(|value| read_fixed::<32>(value, "SP1 block VK hash"))
+        .transpose()?
+        .unwrap_or_else(|| args.network.default_vk_hash());
     let config = E2EBlockPipelineConfig {
+        network: args.network,
         electrs_url: args.electrs_url,
         redis_url: args.redis_url,
         sender_url: args.sender_url,
         sender_bearer_token: args.sender_token,
         gen_proof_path: args.gen_proof_path,
-        block_elf_path: args.block_elf_path,
-        expected_vk_hash: read_fixed::<32>(&args.expected_vk_hash, "SP1 block VK hash")?,
+        block_elf_path,
+        expected_vk_hash,
         evidence_dir: args.evidence_dir,
         poll_interval: Duration::from_millis(args.poll_interval_ms),
         redis_seed: args.redis_seed,
