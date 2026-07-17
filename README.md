@@ -43,6 +43,24 @@ bun integration/e2e/e2e_test.ts --dry-run
 bun integration/e2e/e2e_test.ts --full-live-regtest
 ```
 
+Testnet/QED block ingestion uses the explicit profile and profile-specific embedded SP1 guest. Set the local bridge header/config/keypair values separately; `DOGE_START_HEIGHT` is the already-initialized checkpoint height, so the pipeline ingests `height+1` onward and can continue through `withdrawal_height+5`:
+
+```bash
+export DOGE_NETWORK=testnet
+export DOGE_ELECTRS_URL=https://doge-electrs-testnet-demo.qed.me
+export SP1_GEN_PROOF_PATH=../psy-bridge-sp1/target/release/gen-proof
+export SP1_BLOCK_ELF_PATH=../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition-testnet
+export SP1_BLOCK_VK_HASH=0007e438ca85c9ac7d1465df380f32fc37be58471a0c77a5c3fde317a108eb97
+export DOGE_START_HEIGHT=<bridge-checkpoint-height>
+cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- \
+  --network testnet \
+  --electrs-url https://doge-electrs-testnet-demo.qed.me \
+  --start-height "$DOGE_START_HEIGHT" \
+  # append the required sender/Solana/bridge arguments shown by --help
+```
+
+The pipeline passes `--network testnet` to `gen-proof`, rejects any VK other than the testnet profile key, and checks both the canonical embedded ELF path and SHA-256 against `SP1_BLOCK_ELF_PATH` before accepting prover output.
+
 The live command requires prebuilt release artifacts. In particular, build `psy-doge-solana-cli/doge` release binaries, the SP1 `gen-proof` binary and block ELF, Dogecoin Core, electrs-doge, the bridge programs/CLI, and the block-sender distribution before using `--full-live-regtest`. The launcher intentionally uses `--no-build` in that flow so production repositories supply release artifacts while integration code owns runtime orchestration.
 
 ## Legacy relay workspace and package map

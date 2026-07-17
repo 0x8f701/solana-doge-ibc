@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, path::{Path, PathBuf}, process::Stdio, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use borsh::BorshDeserialize;
 use doge_bridge_client::{BridgeApi, BridgeClient, BridgeClientConfigBuilder, PendingMint};
@@ -18,6 +25,7 @@ use fred::{
     types::Builder,
 };
 use psy_doge_bridge_helper::{
+    block_transition::prover_guest::prover_guest_verify_block_transition_detailed,
     claim::{
         auto_claim_deposits_tree::{
             constants::AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
@@ -33,35 +41,29 @@ use psy_doge_bridge_helper::{
                     PsyBridgeClaimBlockWitness, PsyBridgeClaimBlockWitnessHeader,
                     PsyBridgeClaimBlockWitnessVerifyResult,
                 },
-                tx_witness::{
-                    PsyBridgeClaimBlockTransactionWitness, PsyBridgeClaimDepositItem,
-                },
+                tx_witness::{PsyBridgeClaimBlockTransactionWitness, PsyBridgeClaimDepositItem},
             },
         },
     },
-    constants::{
-        PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE, PSY_DOGE_BRIDGE_BLOCK_TREE_HEIGHT,
-    },
-    block_transition::prover_guest::prover_guest_verify_block_transition_detailed,
+    constants::{PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE, PSY_DOGE_BRIDGE_BLOCK_TREE_HEIGHT},
     data::core::{PsyDogeBridgeIncomingBlockWitness, PsyDogeBridgeState},
     tx_template::{
-        get_manager_custody_output_script, get_manager_custody_redeem_script,
-        CustodyScriptConfig, MANAGER_CUSTODY_REDEEM_SCRIPT_SIZE,
+        get_manager_custody_output_script, get_manager_custody_redeem_script, CustodyScriptConfig,
+        MANAGER_CUSTODY_REDEEM_SCRIPT_SIZE,
     },
     utils::sha256_zero_hashes::SHA256_ZERO_HASHES,
 };
 use serde::{Deserialize, Serialize};
-use speedy::{Readable, Writable};
 use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::{read_keypair_file, Keypair, Signature, Signer},
 };
+use speedy::{Readable, Writable};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
-
 
 use crate::{
     doge_link_rpc_async::DogeLinkElectrsAsyncClient,
@@ -77,12 +79,10 @@ const PROOF_SIZE: usize = 356;
 const PUBLIC_VALUES_SIZE: usize = 32;
 const CHECKPOINT_PREFIX: &str = "PDOGE-E2E-BLOCK-CHECKPOINT-V3";
 const EVIDENCE_SCHEMA_VERSION: u32 = 2;
-pub const REGTEST_BLOCK_VK_HASH: [u8; 32] = hex_literal::hex!(
-    "00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c"
-);
-pub const TESTNET_BLOCK_VK_HASH: [u8; 32] = hex_literal::hex!(
-    "006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd"
-);
+pub const REGTEST_BLOCK_VK_HASH: [u8; 32] =
+    hex_literal::hex!("00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c");
+pub const TESTNET_BLOCK_VK_HASH: [u8; 32] =
+    hex_literal::hex!("006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd");
 
 const SOL_TIP_BLOCK_HASH: std::ops::Range<usize> = 0..32;
 const SOL_TIP_BLOCK_MERKLE_ROOT: std::ops::Range<usize> = 32..64;
@@ -101,10 +101,8 @@ const SOL_LAST_ROLLBACK_AT_SECS: std::ops::Range<usize> = 304..308;
 const SOL_PAUSED_UNTIL_SECS: std::ops::Range<usize> = 308..312;
 const SOL_TOTAL_FINALIZED_FEES: std::ops::Range<usize> = 312..320;
 
-type BridgeState = QEDDogeChainStateCore<
-    PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE,
-    PSY_DOGE_BRIDGE_BLOCK_TREE_HEIGHT,
->;
+type BridgeState =
+    QEDDogeChainStateCore<PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE, PSY_DOGE_BRIDGE_BLOCK_TREE_HEIGHT>;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -134,8 +132,10 @@ impl DogeNetworkProfile {
             Self::Regtest => "block-transition",
             Self::Testnet => "block-transition-testnet",
         };
-        PathBuf::from("../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release")
-            .join(name)
+        PathBuf::from(
+            "../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release",
+        )
+        .join(name)
     }
 }
 
@@ -186,7 +186,11 @@ impl MerkleFrontier {
         }
     }
 
-    fn decode(&self, expected_height: usize, name: &str) -> anyhow::Result<(QHash256, Vec<QHash256>)> {
+    fn decode(
+        &self,
+        expected_height: usize,
+        name: &str,
+    ) -> anyhow::Result<(QHash256, Vec<QHash256>)> {
         let value = decode_hash(&self.value_hex, &format!("{name} value"))?;
         if self.siblings_hex.len() != expected_height {
             anyhow::bail!(
@@ -358,7 +362,6 @@ impl std::fmt::Display for ProverRequestError {
 
 impl std::error::Error for ProverRequestError {}
 
-
 #[derive(Debug, Deserialize)]
 struct ProverIdentityResponse {
     kind: String,
@@ -401,12 +404,14 @@ struct ProverProofRequest<'a> {
     config_params: String,
 }
 
+const MAX_PROVER_DIAGNOSTICS_BYTES: usize = 256 * 1024;
+
 struct ProverDaemon {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    stderr_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    stderr: Vec<u8>,
+    stderr_task: Option<JoinHandle<std::io::Result<()>>>,
+    stderr: Arc<tokio::sync::Mutex<Vec<u8>>>,
     vk_hash: [u8; 32],
 }
 
@@ -434,17 +439,30 @@ impl ProverDaemon {
             .stderr
             .take()
             .ok_or_else(|| anyhow::anyhow!("gen-proof daemon stderr was not piped"))?;
+        let stderr_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let task_stderr_bytes = Arc::clone(&stderr_bytes);
         let stderr_task = tokio::spawn(async move {
             let mut stderr = stderr;
-            let mut bytes = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut bytes).await?;
-            Ok(bytes)
+            let mut chunk = [0u8; 8192];
+            loop {
+                let bytes_read = tokio::io::AsyncReadExt::read(&mut stderr, &mut chunk).await?;
+                if bytes_read == 0 {
+                    break;
+                }
+                let mut diagnostics = task_stderr_bytes.lock().await;
+                diagnostics.extend_from_slice(&chunk[..bytes_read]);
+                if diagnostics.len() > MAX_PROVER_DIAGNOSTICS_BYTES {
+                    let keep_from = diagnostics.len() - MAX_PROVER_DIAGNOSTICS_BYTES;
+                    diagnostics.drain(..keep_from);
+                }
+            }
+            Ok(())
         });
         let mut daemon = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-            stderr: Vec::new(),
+            stderr: stderr_bytes,
             stderr_task: Some(stderr_task),
             vk_hash: [0; 32],
         };
@@ -518,7 +536,10 @@ impl ProverDaemon {
         let response: ProverProofResponse = serde_json::from_slice(&response_line)
             .map_err(|error| anyhow::anyhow!("malformed gen-proof response: {error}"))?;
         if response.kind != "proof" {
-            anyhow::bail!("gen-proof response kind was '{}', expected 'proof'", response.kind);
+            anyhow::bail!(
+                "gen-proof response kind was '{}', expected 'proof'",
+                response.kind
+            );
         }
         if response.request_id != request_id {
             anyhow::bail!(
@@ -534,10 +555,8 @@ impl ProverDaemon {
         }
         validate_proof_response(config, self.vk_hash, &response)?;
         let proof = decode_required_response_bytes(response.proof_bytes.as_deref(), "proof_bytes")?;
-        let public_values = decode_required_response_bytes(
-            response.public_values.as_deref(),
-            "public_values",
-        )?;
+        let public_values =
+            decode_required_response_bytes(response.public_values.as_deref(), "public_values")?;
         if response.proof_size != Some(proof.len()) {
             anyhow::bail!(
                 "gen-proof proof_size {:?} did not match {} returned bytes",
@@ -554,7 +573,7 @@ impl ProverDaemon {
         }
         tokio::fs::write(PROOF_PATH, proof).await?;
         tokio::fs::write(PUBLIC_VALUES_PATH, public_values).await?;
-        let stderr = self.finish_stderr().await;
+        let stderr = self.take_stderr().await;
         Ok(ProverOutput {
             stdout: response_line,
             stderr,
@@ -563,38 +582,57 @@ impl ProverDaemon {
     }
 
     async fn read_response_line(&mut self) -> anyhow::Result<Vec<u8>> {
-        let mut line = Vec::new();
-        let bytes_read = self.stdout.read_until(b'\n', &mut line).await?;
-        if bytes_read == 0 {
-            let status = self.child.wait().await?;
-            let stderr = self.finish_stderr().await;
-            anyhow::bail!(
-                "gen-proof daemon closed stdout with {status}; stderr:\n{}",
-                String::from_utf8_lossy(&stderr)
-            );
+        loop {
+            let mut line = Vec::new();
+            let bytes_read = tokio::select! {
+                biased;
+                read_result = self.stdout.read_until(b'\n', &mut line) => read_result?,
+                status_result = self.child.wait() => {
+                    let status = status_result?;
+                    let stderr = self.finish_stderr().await;
+                    anyhow::bail!(
+                        "gen-proof daemon exited with {status} before returning a response; stderr:\n{}",
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+            };
+            if bytes_read == 0 {
+                let status = self.child.wait().await?;
+                let stderr = self.finish_stderr().await;
+                anyhow::bail!(
+                    "gen-proof daemon closed stdout with {status}; stderr:\n{}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(b"{") {
+                return Ok(line);
+            }
+            let mut diagnostics = self.stderr.lock().await;
+            diagnostics.extend_from_slice(&line);
+            diagnostics.push(b'\n');
+            if diagnostics.len() > MAX_PROVER_DIAGNOSTICS_BYTES {
+                let keep_from = diagnostics.len() - MAX_PROVER_DIAGNOSTICS_BYTES;
+                diagnostics.drain(..keep_from);
+            }
         }
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
-        if line.is_empty() {
-            anyhow::bail!("gen-proof daemon returned an empty response line");
-        }
-        Ok(line)
+    }
+
+    async fn take_stderr(&self) -> Vec<u8> {
+        let mut stderr = self.stderr.lock().await;
+        std::mem::take(&mut *stderr)
     }
 
     async fn finish_stderr(&mut self) -> Vec<u8> {
-        if self
-            .stderr_task
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
-            if let Some(task) = self.stderr_task.take() {
-                if let Ok(Ok(bytes)) = task.await {
-                    self.stderr.extend_from_slice(&bytes);
-                }
-            }
+        if let Some(task) = self.stderr_task.take() {
+            let _ = task.await;
         }
-        self.stderr.clone()
+        self.take_stderr().await
     }
 
     async fn terminate(mut self) {
@@ -606,9 +644,8 @@ impl ProverDaemon {
             }
         }
         if let Some(task) = self.stderr_task.take() {
-            if let Ok(Ok(bytes)) = task.await {
-                self.stderr.extend_from_slice(&bytes);
-            }
+            task.abort();
+            let _ = task.await;
         }
     }
 }
@@ -701,8 +738,7 @@ impl E2EBlockPipeline {
                 Pubkey::new_from_array(chain_state.access_control.operator_pubkey)
             );
         }
-        let expected_custodian_hash =
-            CustodyScriptConfig::new(config.custody_script_config).hash();
+        let expected_custodian_hash = CustodyScriptConfig::new(config.custody_script_config).hash();
         if chain_state.custodian_wallet_config_hash != expected_custodian_hash {
             anyhow::bail!(
                 "on-chain custodian wallet config hash {} does not match manager custody script config hash {}",
@@ -773,10 +809,12 @@ impl E2EBlockPipeline {
 
         match self.config.network {
             DogeNetworkProfile::Regtest => {
-                self.process_height::<DogeRegTestConfig>(next_height).await?
+                self.process_height::<DogeRegTestConfig>(next_height)
+                    .await?
             }
             DogeNetworkProfile::Testnet => {
-                self.process_height::<DogeTestNetConfig>(next_height).await?
+                self.process_height::<DogeTestNetConfig>(next_height)
+                    .await?
             }
         }
         Ok(true)
@@ -801,14 +839,7 @@ impl E2EBlockPipeline {
             .await;
         }
 
-        prepare_prover_request(
-            &self.config,
-            old_state,
-            witness,
-            old_header,
-            new_header,
-        )
-        .await?;
+        prepare_prover_request(&self.config, old_state, witness, old_header, new_header).await?;
         let request_id = format!("block-{height}");
         let first_result = match &mut self.prover {
             ProverProcess::Daemon(prover) => {
@@ -966,7 +997,8 @@ impl E2EBlockPipeline {
             anyhow::bail!("pipeline and guest helper produced different new chain states");
         }
 
-        let old_header = decode_fixed::<HEADER_SIZE>(&self.checkpoint.header_hex, "checkpoint header")?;
+        let old_header =
+            decode_fixed::<HEADER_SIZE>(&self.checkpoint.header_hex, "checkpoint header")?;
         let new_header = build_new_solana_header(
             &old_header,
             &new_state,
@@ -1210,7 +1242,11 @@ impl E2EBlockPipeline {
             );
         }
         Ok(MintProcessingEvidence {
-            signatures: result.signatures.into_iter().map(|signature| signature.to_string()).collect(),
+            signatures: result
+                .signatures
+                .into_iter()
+                .map(|signature| signature.to_string())
+                .collect(),
             groups_processed: result.groups_processed,
             total_mints_processed: result.total_mints_processed,
         })
@@ -1240,9 +1276,8 @@ async fn initialize_checkpoint(
     let headers = block_rpc
         .get_qd_block_headers_range_parallel(first, start_height)
         .await?;
-    let headers: [QDogeBlockHeader; PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE] = headers
-        .try_into()
-        .map_err(|headers: Vec<_>| {
+    let headers: [QDogeBlockHeader; PSY_DOGE_BRIDGE_BLOCK_HASH_CACHE_SIZE] =
+        headers.try_into().map_err(|headers: Vec<_>| {
             anyhow::anyhow!("expected 32 initialization headers, got {}", headers.len())
         })?;
     let state = PsyDogeBridgeState::from_init_data(
@@ -1253,14 +1288,9 @@ async fn initialize_checkpoint(
     let claim_siblings: [QHash256; AUTO_CLAIM_DEPOSITS_TREE_HEIGHT] =
         core::array::from_fn(|index| SHA256_ZERO_HASHES[index]);
     let txo_siblings: [QHash256; TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH] =
-        core::array::from_fn(|index| {
-            SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT + index]
-        });
+        core::array::from_fn(|index| SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT + index]);
     let txo_block_history = if start_height <= 1_000_000 {
-        vec![
-            SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT];
-            start_height as usize + 1
-        ]
+        vec![SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT]; start_height as usize + 1]
     } else {
         Vec::new()
     };
@@ -1342,10 +1372,13 @@ fn validate_live_deposit_script(
     if !path.is_file() {
         return Ok(());
     }
-    let evidence: DepositEvidenceDocument = serde_json::from_slice(
-        &std::fs::read(path)
-            .map_err(|error| anyhow::anyhow!("failed to read deposit evidence {}: {error}", path.display()))?,
-    )?;
+    let evidence: DepositEvidenceDocument =
+        serde_json::from_slice(&std::fs::read(path).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read deposit evidence {}: {error}",
+                path.display()
+            )
+        })?)?;
     if evidence.deposit.confirmation_height != Some(height) {
         return Ok(());
     }
@@ -1361,7 +1394,15 @@ fn validate_live_deposit_script(
     }
     let expected_redeem_script =
         get_manager_custody_redeem_script(custody_script_config, &recipient_ata);
-    let actual_redeem_script = hex::decode(evidence.custody.redeem_script_hex.as_deref().ok_or_else(|| anyhow::anyhow!("confirmed deposit evidence is missing redeem_script_hex"))?)?;
+    let actual_redeem_script = hex::decode(
+        evidence
+            .custody
+            .redeem_script_hex
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("confirmed deposit evidence is missing redeem_script_hex")
+            })?,
+    )?;
     if actual_redeem_script != expected_redeem_script {
         anyhow::bail!(
             "deposit {} at height {height} redeem script does not match the exact {}-byte deterministic 5-of-7 manager custody script for recipient ATA {}",
@@ -1371,12 +1412,18 @@ fn validate_live_deposit_script(
         );
     }
     let expected_script = get_manager_custody_output_script(custody_script_config, &recipient_ata);
-    let actual_script = hex::decode(evidence.custody.script_pubkey_hex.as_deref().ok_or_else(|| anyhow::anyhow!("confirmed deposit evidence is missing script_pubkey_hex"))?)?;
+    let actual_script = hex::decode(evidence.custody.script_pubkey_hex.as_deref().ok_or_else(
+        || anyhow::anyhow!("confirmed deposit evidence is missing script_pubkey_hex"),
+    )?)?;
     if actual_script != expected_script {
         anyhow::bail!(
             "deposit {} at height {height} P2SH output {} does not match manager custody output {}",
             evidence.deposit.txid,
-            evidence.custody.script_pubkey_hex.as_deref().unwrap_or("<missing>"),
+            evidence
+                .custody
+                .script_pubkey_hex
+                .as_deref()
+                .unwrap_or("<missing>"),
             hex::encode(expected_script),
         );
     }
@@ -1480,10 +1527,8 @@ fn build_deposit_claim_witness(
         }
     }
 
-    let claim_last_value = decode_hash(
-        &checkpoint.claim_frontier.value_hex,
-        "claim frontier value",
-    )?;
+    let claim_last_value =
+        decode_hash(&checkpoint.claim_frontier.value_hex, "claim frontier value")?;
     let claim_siblings = if checkpoint.claim_history.is_empty() {
         checkpoint
             .claim_frontier
@@ -1738,9 +1783,7 @@ fn sequential_next_leaf_siblings(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("{name} index overflow"))?;
     if new_index != expected_index {
-        anyhow::bail!(
-            "{name} expected next index {expected_index}, got {new_index}"
-        );
+        anyhow::bail!("{name} expected next index {expected_index}, got {new_index}");
     }
     let (last_value, last_siblings) = frontier.decode(height, name)?;
     let mut current = last_value;
@@ -1768,12 +1811,7 @@ fn sequential_next_leaf_siblings(
         .collect())
 }
 
-
-fn frontier_root(
-    frontier: &MerkleFrontier,
-    height: usize,
-    name: &str,
-) -> anyhow::Result<QHash256> {
+fn frontier_root(frontier: &MerkleFrontier, height: usize, name: &str) -> anyhow::Result<QHash256> {
     let (mut current, siblings) = frontier.decode(height, name)?;
     let mut index = frontier.index;
     for sibling in siblings {
@@ -1806,13 +1844,12 @@ fn validate_frontiers_against_state(
         anyhow::bail!("claim frontier root does not match checkpoint state");
     }
     let claim_value = decode_hash(&checkpoint.claim_frontier.value_hex, "claim frontier value")?;
-    let expected_claim_index = if checkpoint.claim_frontier.index == 0
-        && claim_value == SHA256_ZERO_HASHES[0]
-    {
-        0
-    } else {
-        checkpoint.claim_frontier.index + 1
-    };
+    let expected_claim_index =
+        if checkpoint.claim_frontier.index == 0 && claim_value == SHA256_ZERO_HASHES[0] {
+            0
+        } else {
+            checkpoint.claim_frontier.index + 1
+        };
     let state_claim_index: u32 = tip.auto_claimed_deposits_next_index.into();
     if expected_claim_index != state_claim_index {
         anyhow::bail!(
@@ -1859,8 +1896,7 @@ fn build_new_solana_header(
     new_header[SOL_TIP_BLOCK_HEIGHT].copy_from_slice(&tip.block_height.to_le_bytes());
 
     new_header[SOL_FINALIZED_BLOCK_HASH].copy_from_slice(&finalized.block_hash);
-    new_header[SOL_FINALIZED_BLOCK_MERKLE_ROOT]
-        .copy_from_slice(&finalized.block_merkle_tree_root);
+    new_header[SOL_FINALIZED_BLOCK_MERKLE_ROOT].copy_from_slice(&finalized.block_merkle_tree_root);
     new_header[SOL_FINALIZED_PENDING_MINTS_HASH].copy_from_slice(&pending_mints_hash);
     new_header[SOL_FINALIZED_TXO_LIST_HASH].copy_from_slice(&txo_output_list_hash);
     new_header[SOL_FINALIZED_AUTO_CLAIMED_TXO_ROOT]
@@ -1952,7 +1988,9 @@ async fn run_gen_proof_one_shot(
 
 fn daemon_mode_unsupported(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
-    message.contains("unexpected argument '--daemon'") || message.contains("unexpected argument '--network'")
+    message.contains("unexpected argument '--daemon'")
+        || message.contains("unexpected argument '--network'")
+        || message.contains("daemon protocol stdout isolation requires Unix")
 }
 
 fn parse_prover_field<'a>(stdout: &'a [u8], field: &str) -> anyhow::Result<&'a str> {
@@ -1992,7 +2030,11 @@ async fn prepare_prover_request(
             "new_header": hex::encode(new_header),
             "config_params": hex::encode(config.config_params),
         });
-        tokio::fs::write("/tmp/psy-block-prover-args.json", serde_json::to_vec_pretty(&args)?).await?;
+        tokio::fs::write(
+            "/tmp/psy-block-prover-args.json",
+            serde_json::to_vec_pretty(&args)?,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2014,12 +2056,7 @@ async fn validate_prover_identity(
             identity.network
         );
     }
-    validate_prover_elf(
-        config,
-        &identity.block_elf_path,
-        &identity.block_elf_sha256,
-    )
-    .await?;
+    validate_prover_elf(config, &identity.block_elf_path, &identity.block_elf_sha256).await?;
     let vk_hash = decode_prover_hash(&identity.vkey_hash, "SP1 program VK hash")?;
     if vk_hash != config.expected_vk_hash {
         anyhow::bail!(
@@ -2115,7 +2152,6 @@ fn decode_prover_hash(value: &str, name: &str) -> anyhow::Result<[u8; 32]> {
     decode_fixed::<32>(value.strip_prefix("0x").unwrap_or(value), name)
 }
 
-
 async fn persist_evidence(
     config: &E2EBlockPipelineConfig,
     height: u32,
@@ -2144,11 +2180,7 @@ async fn persist_evidence(
         height,
         block_hash: hex::encode(&block_hash),
         custody_script_config: hex::encode(config.custody_script_config),
-        recipient_atas: config
-            .recipient_atas
-            .iter()
-            .map(hex::encode)
-            .collect(),
+        recipient_atas: config.recipient_atas.iter().map(hex::encode).collect(),
         required_confirmations: config.required_confirmations,
         flat_fee: deposit_flat_fee(&config.config_params),
         fee_num: deposit_fee_numerator(&config.config_params),
@@ -2188,9 +2220,7 @@ async fn persist_evidence(
     ];
     let content_sha256 = artifact_bundle_sha256(&artifact_bytes);
     let root = absolute_path(&config.evidence_dir)?;
-    let evidence_dir = root
-        .join(format!("height-{height}"))
-        .join(&content_sha256);
+    let evidence_dir = root.join(format!("height-{height}")).join(&content_sha256);
     tokio::fs::create_dir_all(&evidence_dir).await?;
 
     let mut artifacts = BTreeMap::new();
@@ -2381,8 +2411,9 @@ fn combined_txo_index(transaction_index: u32, output_index: u32) -> anyhow::Resu
 }
 
 fn read_pipeline_keypair(path: &Path, name: &str) -> anyhow::Result<Keypair> {
-    read_keypair_file(path)
-        .map_err(|error| anyhow::anyhow!("failed to read {name} keypair {}: {error}", path.display()))
+    read_keypair_file(path).map_err(|error| {
+        anyhow::anyhow!("failed to read {name} keypair {}: {error}", path.display())
+    })
 }
 
 fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -2429,7 +2460,8 @@ fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
     if deposit_fee_denominator(&config.config_params) == 0 {
         anyhow::bail!("deposit fee denominator must be non-zero");
     }
-    let expected_bridge_state = Pubkey::find_program_address(&[b"bridge_state"], &config.bridge_program).0;
+    let expected_bridge_state =
+        Pubkey::find_program_address(&[b"bridge_state"], &config.bridge_program).0;
     if config.custody_script_config != expected_bridge_state.to_bytes() {
         anyhow::bail!(
             "custody script config {} does not match bridge-state PDA {expected_bridge_state}",
@@ -2437,7 +2469,9 @@ fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
         );
     }
     if config.recipient_atas.is_empty() {
-        anyhow::bail!("at least one recipient ATA is required for manager custody auto-claim scanning");
+        anyhow::bail!(
+            "at least one recipient ATA is required for manager custody auto-claim scanning"
+        );
     }
     for (index, key) in config.recipient_atas.iter().enumerate() {
         if config.recipient_atas[..index].contains(key) {
@@ -2471,11 +2505,17 @@ fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
 }
 
 fn ensure_release_path(path: &Path, name: &str) -> anyhow::Result<()> {
-    let components: Vec<_> = path.components().map(|component| component.as_os_str()).collect();
+    let components: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str())
+        .collect();
     let has_release = components.iter().any(|component| *component == "release");
     let has_debug = components.iter().any(|component| *component == "debug");
     if !has_release || has_debug {
-        anyhow::bail!("{name} must be loaded from a release path: {}", path.display());
+        anyhow::bail!(
+            "{name} must be loaded from a release path: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -2486,8 +2526,7 @@ fn validate_checkpoint(checkpoint: &PipelineCheckpoint) -> anyhow::Result<()> {
         &hex::decode(&checkpoint.header_hex)?,
         HEADER_SIZE,
     )?;
-    if checkpoint.claim_history.len() > 1_000_000
-        || checkpoint.txo_block_history.len() > 1_000_000
+    if checkpoint.claim_history.len() > 1_000_000 || checkpoint.txo_block_history.len() > 1_000_000
     {
         anyhow::bail!("checkpoint Merkle history exceeds the E2E safety limit");
     }
@@ -2579,6 +2618,123 @@ mod tests {
         core_data::QStandardBlockHeader,
         doge::transaction::{BTCTransaction, BTCTransactionOutput},
     };
+    #[cfg(unix)]
+    use tokio::process::Command;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_response_wait_reports_early_child_exit() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf diagnostic >&2; exit 23")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn diagnostic child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let task_stderr_bytes = Arc::clone(&stderr_bytes);
+        let stderr_task = tokio::spawn(async move {
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut *task_stderr_bytes.lock().await)
+                .await
+                .map(|_| ())
+        });
+        let mut daemon = ProverDaemon {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_task: Some(stderr_task),
+            stderr: stderr_bytes,
+            vk_hash: [0; 32],
+        };
+
+        let error = tokio::time::timeout(Duration::from_secs(2), daemon.read_response_line())
+            .await
+            .expect("early exit must not hang")
+            .expect_err("early exit must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("exit status: 23"), "{message}");
+        assert!(message.contains("diagnostic"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_response_wait_skips_non_json_startup_banner() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(r#"printf '%s\n' 'startup banner' '{"kind":"identity"}'; sleep 1"#)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn diagnostic child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let task_stderr_bytes = Arc::clone(&stderr_bytes);
+        let stderr_task = tokio::spawn(async move {
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut *task_stderr_bytes.lock().await)
+                .await
+                .map(|_| ())
+        });
+        let mut daemon = ProverDaemon {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_task: Some(stderr_task),
+            stderr: stderr_bytes,
+            vk_hash: [0; 32],
+        };
+
+        let response = daemon
+            .read_response_line()
+            .await
+            .expect("read JSON response");
+        assert_eq!(response, br#"{"kind":"identity"}"#);
+        assert!(String::from_utf8(daemon.finish_stderr().await)
+            .expect("captured diagnostics are UTF-8")
+            .contains("startup banner"));
+        daemon.terminate().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_diagnostics_are_drained_per_request() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 10")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn diagnostic child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr_task = tokio::spawn(async { Ok(()) });
+        let stderr = Arc::new(tokio::sync::Mutex::new(b"request-one".to_vec()));
+        let mut daemon = ProverDaemon {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_task: Some(stderr_task),
+            stderr,
+            vk_hash: [0; 32],
+        };
+
+        assert_eq!(daemon.take_stderr().await, b"request-one");
+        assert!(daemon.take_stderr().await.is_empty());
+        daemon.terminate().await;
+    }
+
+    #[test]
+    fn unsupported_platform_daemon_falls_back_to_one_shot() {
+        let error = anyhow::anyhow!("daemon protocol stdout isolation requires Unix");
+        assert!(daemon_mode_unsupported(&error));
+    }
 
     const CUSTODY_SCRIPT_CONFIG: CustodyScriptConfig = CustodyScriptConfig::new([7u8; 32]);
     const RECIPIENT_ATA: [u8; 32] = [9u8; 32];
@@ -2665,7 +2821,6 @@ mod tests {
         assert_eq!(checkpoint.txo_block_frontier.index + 1, next);
     }
 
-
     #[tokio::test]
     #[ignore = "live QED Dogecoin testnet check"]
     async fn qed_testnet_block_constructs_real_guest_input() {
@@ -2705,10 +2860,7 @@ mod tests {
             pending_finalization: BTreeMap::new(),
         };
         let block = rpc.get_qd_block(BLOCK_HEIGHT).await.unwrap();
-        assert_eq!(
-            block.header.previous_block_hash,
-            state.get_tip_block_hash()
-        );
+        assert_eq!(block.header.previous_block_hash, state.get_tip_block_hash());
         let witness = build_deposit_claim_witness(
             &block,
             &checkpoint,
@@ -2939,7 +3091,9 @@ mod tests {
             &[RECIPIENT_ATA],
         )
         .unwrap_err();
-        assert!(error.to_string().contains("exact 312-byte deterministic 5-of-7"));
+        assert!(error
+            .to_string()
+            .contains("exact 312-byte deterministic 5-of-7"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3021,7 +3175,14 @@ mod tests {
         let mut pending = BTreeMap::new();
         pending.insert(300, source.clone());
 
-        assert_eq!(pending.get(&299).cloned().unwrap_or(empty.clone()).deposit_count, 0);
+        assert_eq!(
+            pending
+                .get(&299)
+                .cloned()
+                .unwrap_or(empty.clone())
+                .deposit_count,
+            0
+        );
         let finalized = pending.get(&300).cloned().unwrap_or(empty);
         assert_eq!(finalized.deposit_count, 1);
         assert_eq!(finalized.minted_amount_sats, 99);
@@ -3063,52 +3224,35 @@ mod tests {
         let first_frontier = MerkleFrontier::new(
             0,
             first_leaf,
-            &sparse_sha256_merkle_siblings(
-                &first_history,
-                0,
-                AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-                0,
-            )
-            .unwrap(),
+            &sparse_sha256_merkle_siblings(&first_history, 0, AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, 0)
+                .unwrap(),
         );
         let second_history = vec![first_leaf, second_leaf];
         let second_frontier = MerkleFrontier::new(
             1,
             second_leaf,
-            &sparse_sha256_merkle_siblings(
-                &second_history,
-                1,
-                AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-                0,
-            )
-            .unwrap(),
+            &sparse_sha256_merkle_siblings(&second_history, 1, AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, 0)
+                .unwrap(),
         );
 
-        let first_root = frontier_root(
-            &first_frontier,
-            AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-            "first",
-        )
-        .unwrap();
-        let second_root = frontier_root(
-            &second_frontier,
-            AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-            "second",
-        )
-        .unwrap();
+        let first_root =
+            frontier_root(&first_frontier, AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, "first").unwrap();
+        let second_root =
+            frontier_root(&second_frontier, AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, "second").unwrap();
         assert_ne!(first_root, second_root);
-        let rebuilt = psy_doge_bridge_helper::utils::append_only_merkle_tree::AppendOnlyMerkleTreeFixed::<
-            AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-            0,
-        >::new_from_siblings(
-            &first_frontier
-                .decode(AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, "first")
-                .unwrap()
-                .1,
-            0,
-            &first_leaf,
-        )
-        .unwrap();
+        let rebuilt =
+            psy_doge_bridge_helper::utils::append_only_merkle_tree::AppendOnlyMerkleTreeFixed::<
+                AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
+                0,
+            >::new_from_siblings(
+                &first_frontier
+                    .decode(AUTO_CLAIM_DEPOSITS_TREE_HEIGHT, "first")
+                    .unwrap()
+                    .1,
+                0,
+                &first_leaf,
+            )
+            .unwrap();
         assert_eq!(rebuilt.start_root, first_root);
         assert_eq!(rebuilt.next_index, 1);
     }
