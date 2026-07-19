@@ -18,7 +18,7 @@ async fn run_block_processor() -> anyhow::Result<()> {
     type DNConfig = DogeTestNetConfig;
     let rpc_client = DogeLinkElectrsAsyncClient::new("https://doge-electrs-testnet-demo.qed.me".to_string());
     let config = Config::from_url("redis://127.0.0.1:6379")?;
-    let sol_submitter_client = SolSubmitterClient::new("http://localhost:3000".to_string(), "doge-test-api-key".to_string());
+    let sol_submitter_client = SolSubmitterClient::new("http://localhost:3000".to_string(), "doge-test-api-key".to_string())?;
     let suffix_seed = 1337u64;
 
     

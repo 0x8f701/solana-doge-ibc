@@ -10,10 +10,3 @@ dist
 test_blocks/*
 /target
 test_blocks
-integration/e2e/deployments/
-integration/e2e/evidence/
-integration/e2e/*.json
-integration/e2e/*.log
-integration/e2e/keys/
-integration/e2e/*.sqlite3
-integration/e2e/*.bin

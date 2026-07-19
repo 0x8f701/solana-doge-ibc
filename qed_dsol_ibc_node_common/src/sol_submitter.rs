@@ -66,30 +66,32 @@ pub struct BlockUpdateResponse {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SolSubmitterClient {
     pub base_url: String,
     pub api_key: String,
+    client: reqwest::Client,
 }
 impl SolSubmitterClient {
     /// Constructs the legacy IBC-v3 client, whose existing methods use x-api-key.
 
-    pub fn new(url: String, api_key: String) -> Self {
-        Self {
-            base_url: format!("{}/api/v1", url),
-            api_key,
-        }
+    pub fn new(url: String, api_key: String) -> anyhow::Result<Self> {
+        Self::build(url, api_key)
     }
-    pub fn new_with_bearer_token(url: String, bearer_token: String) -> Self {
-        Self {
-            base_url: format!("{}/api/v1", url),
-            api_key: bearer_token,
-        }
+    pub fn new_with_bearer_token(url: String, bearer_token: String) -> anyhow::Result<Self> {
+        Self::build(url, bearer_token)
+    }
+
+    fn build(url: String, api_key: String) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self { base_url: format!("{}/api/v1", url), api_key, client })
     }
 
     pub async fn init_ibc_program_state(&self, block_state_bytes: &[u8]) -> anyhow::Result<()> {
         let url = format!("{}/init-ibc", self.base_url);
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let res = client.post(&url)
             .header("x-api-key", self.api_key.clone())
             .json(&SSCInitIBCStateRequestBody {
@@ -119,7 +121,7 @@ impl SolSubmitterClient {
     }
     pub async fn get_ibc_program_state_inner(&self) -> anyhow::Result<Option<Vec<u8>>> {
         let url = format!("{}/get-ibc-state", self.base_url);
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let res = client.get(&url)
             .header("x-api-key", self.api_key.clone())
             .send()
@@ -139,7 +141,7 @@ impl SolSubmitterClient {
 
     pub async fn append_block_zkp(&self, block_height: u32, block_header_bytes: &[u8], proof_result: &DogeBlockScryptProofOutput) -> anyhow::Result<()> {
         let url = format!("{}/append-block-zkp", self.base_url);
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let res = client.post(&url)
             .header("x-api-key", self.api_key.clone())
             .json(&SSCInitContractStateRequestBody {
@@ -165,7 +167,7 @@ impl SolSubmitterClient {
         request: &BlockUpdateRequestBody,
     ) -> anyhow::Result<BlockUpdateResponse> {
         let url = format!("{}/block-update", self.base_url);
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let mut builder = client.post(&url).json(request);
         if !self.api_key.is_empty() {
             builder = builder.bearer_auth(&self.api_key);

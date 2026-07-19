@@ -8,7 +8,9 @@ use std::{
 };
 
 use borsh::BorshDeserialize;
-use doge_bridge_client::{BridgeApi, BridgeClient, BridgeClientConfigBuilder, PendingMint};
+use doge_bridge_client::{
+    BridgeApi, BridgeClient, BridgeClientConfigBuilder, PendingMint, PsyBridgeHeader,
+};
 use doge_light_client::{
     chain_state::QEDDogeChainStateCore,
     common_types::QHash256,
@@ -80,7 +82,7 @@ const PUBLIC_VALUES_SIZE: usize = 32;
 const CHECKPOINT_PREFIX: &str = "PDOGE-E2E-BLOCK-CHECKPOINT-V3";
 const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 pub const REGTEST_BLOCK_VK_HASH: [u8; 32] =
-    hex_literal::hex!("00032a98cc2c3379e6b0a87804b87d01b9b7dda16e6c635c02829bf1a931e24c");
+    hex_literal::hex!("002ed3c169b6415db45e569dd01675bfb2ba89c59c7d26582f3a22d2ec313ee8");
 pub const TESTNET_BLOCK_VK_HASH: [u8; 32] =
     hex_literal::hex!("006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd");
 
@@ -289,6 +291,7 @@ struct PipelineCheckpoint {
     txo_block_history: Vec<QHash256>,
     pending_finalization: BTreeMap<u32, BlockBufferCommitment>,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceArtifact {
@@ -652,7 +655,7 @@ impl ProverDaemon {
 
 enum ProverProcess {
     Daemon(ProverDaemon),
-    OneShot,
+    Stopped,
 }
 
 #[derive(Serialize)]
@@ -765,17 +768,21 @@ impl E2EBlockPipeline {
             None => initialize_checkpoint(&config, &block_rpc).await?,
         };
         validate_checkpoint(&checkpoint)?;
+        assert_checkpoint_matches_chain(&checkpoint, &chain_state.bridge_header)?;
 
-        let prover = match ProverDaemon::start(&config).await {
-            Ok(prover) => ProverProcess::Daemon(prover),
-            Err(error) if daemon_mode_unsupported(&error) => ProverProcess::OneShot,
-            Err(error) => return Err(error),
-        };
+        let prover = ProverProcess::Daemon(ProverDaemon::start(&config).await?);
+        eprintln!(
+            "block pipeline started: network={} checkpoint={} sender={} electrs={}",
+            config.network.as_str(),
+            checkpoint.height,
+            config.sender_url,
+            config.electrs_url,
+        );
         Ok(Self {
             sender: SolSubmitterClient::new_with_bearer_token(
                 config.sender_url.clone(),
                 config.sender_bearer_token.clone(),
-            ),
+            )?,
             bridge_client,
             block_rpc,
             redis,
@@ -787,11 +794,47 @@ impl E2EBlockPipeline {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        loop {
-            if let Err(error) = self.poll_once().await {
-                eprintln!("block pipeline poll failed: {error:#}");
+        #[cfg(unix)]
+        let result = {
+            let mut terminate = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )?;
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break Ok(()),
+                    _ = terminate.recv() => break Ok(()),
+                    result = self.poll_once() => match result {
+                        Err(error) => break Err(error),
+                        Ok(_) => tokio::select! {
+                            _ = tokio::signal::ctrl_c() => break Ok(()),
+                            _ = terminate.recv() => break Ok(()),
+                            _ = tokio::time::sleep(self.config.poll_interval) => {}
+                        },
+                    }
+                }
             }
-            tokio::time::sleep(self.config.poll_interval).await;
+        };
+        #[cfg(not(unix))]
+        let result = loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break Ok(()),
+                result = self.poll_once() => match result {
+                    Err(error) => break Err(error),
+                    Ok(_) => tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break Ok(()),
+                        _ = tokio::time::sleep(self.config.poll_interval) => {}
+                    },
+                }
+            }
+        };
+        self.shutdown().await;
+        result
+    }
+
+    async fn shutdown(&mut self) {
+        let prover = std::mem::replace(&mut self.prover, ProverProcess::Stopped);
+        if let ProverProcess::Daemon(prover) = prover {
+            prover.terminate().await;
         }
     }
 
@@ -828,15 +871,8 @@ impl E2EBlockPipeline {
         old_header: &[u8; HEADER_SIZE],
         new_header: &[u8; HEADER_SIZE],
     ) -> anyhow::Result<ProverOutput> {
-        if matches!(&self.prover, ProverProcess::OneShot) {
-            return run_gen_proof_one_shot(
-                &self.config,
-                old_state,
-                witness,
-                old_header,
-                new_header,
-            )
-            .await;
+        if matches!(&self.prover, ProverProcess::Stopped) {
+            anyhow::bail!("gen-proof daemon is stopped");
         }
 
         prepare_prover_request(&self.config, old_state, witness, old_header, new_header).await?;
@@ -854,7 +890,7 @@ impl E2EBlockPipeline {
                     )
                     .await
             }
-            ProverProcess::OneShot => unreachable!("handled above"),
+            ProverProcess::Stopped => unreachable!("checked above"),
         };
         let first_error = match first_result {
             Ok(output) => return Ok(output),
@@ -864,7 +900,7 @@ impl E2EBlockPipeline {
             Err(error) => error,
         };
 
-        let old_process = std::mem::replace(&mut self.prover, ProverProcess::OneShot);
+        let old_process = std::mem::replace(&mut self.prover, ProverProcess::Stopped);
         if let ProverProcess::Daemon(prover) = old_process {
             prover.terminate().await;
         }
@@ -898,7 +934,8 @@ impl E2EBlockPipeline {
     }
 
     async fn process_height<NC: DogeNetworkConfig>(&mut self, height: u32) -> anyhow::Result<()> {
-        let generated_state_bytes = hex::decode(&self.checkpoint.state_hex)?;
+        let checkpoint = self.checkpoint.clone();
+        let generated_state_bytes = hex::decode(&checkpoint.state_hex)?;
         let old_state_bytes = read_optional_height_artifact(
             self.config.old_state_dir.as_ref(),
             height,
@@ -907,22 +944,22 @@ impl E2EBlockPipeline {
         )
         .await?;
         let old_state = BridgeState::try_from_slice(&old_state_bytes)?;
-        if old_state.get_tip_block_number() != self.checkpoint.height {
+        if old_state.get_tip_block_number() != checkpoint.height {
             anyhow::bail!(
                 "helper state tip {} does not match checkpoint height {}",
                 old_state.get_tip_block_number(),
-                self.checkpoint.height
+                checkpoint.height
             );
         }
 
-        validate_frontiers_against_state(&self.checkpoint, &old_state)?;
+        validate_frontiers_against_state(&checkpoint, &old_state)?;
 
         let block = self.block_rpc.get_qd_block(height).await?;
         let block_header = block.to_qdoge_block_header();
         if block_header.header.previous_block_hash != old_state.get_tip_block_hash() {
             anyhow::bail!(
                 "block {height} does not extend checkpoint tip {}; reorg handling is out of scope",
-                self.checkpoint.height
+                checkpoint.height
             );
         }
         let custody_script_config = CustodyScriptConfig::new(self.config.custody_script_config);
@@ -936,7 +973,7 @@ impl E2EBlockPipeline {
 
         let generated_witness = build_deposit_claim_witness(
             &block,
-            &self.checkpoint,
+            &checkpoint,
             &custody_script_config,
             &self.config.recipient_atas,
         )?;
@@ -966,8 +1003,7 @@ impl E2EBlockPipeline {
         let finalized_height = height
             .checked_sub(self.config.required_confirmations)
             .ok_or_else(|| anyhow::anyhow!("finalized height underflow"))?;
-        let finalized_buffers = self
-            .checkpoint
+        let finalized_buffers = checkpoint
             .pending_finalization
             .get(&finalized_height)
             .cloned()
@@ -997,8 +1033,7 @@ impl E2EBlockPipeline {
             anyhow::bail!("pipeline and guest helper produced different new chain states");
         }
 
-        let old_header =
-            decode_fixed::<HEADER_SIZE>(&self.checkpoint.header_hex, "checkpoint header")?;
+        let old_header = decode_fixed::<HEADER_SIZE>(&checkpoint.header_hex, "checkpoint header")?;
         let new_header = build_new_solana_header(
             &old_header,
             &new_state,
@@ -1008,6 +1043,71 @@ impl E2EBlockPipeline {
         )?;
         let new_state_bytes = borsh::to_vec(&new_state)?;
 
+        let mut claim_history = checkpoint.claim_history.clone();
+        claim_history.extend_from_slice(&evaluation.deposit_leaf_hashes);
+        let claim_frontier = if let Some(last_leaf) = claim_history.last() {
+            let last_index = claim_history.len() - 1;
+            MerkleFrontier::new(
+                last_index as u32,
+                *last_leaf,
+                &sparse_sha256_merkle_siblings(
+                    &claim_history,
+                    last_index,
+                    AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
+                    0,
+                )?,
+            )
+        } else {
+            checkpoint.claim_frontier.clone()
+        };
+
+        let (txo_block_frontier, txo_block_history) = if checkpoint.txo_block_history.is_empty() {
+            let txo_siblings = sequential_next_leaf_siblings(
+                &checkpoint.txo_block_frontier,
+                height,
+                TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+                TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+                "TXO block frontier",
+            )?;
+            (
+                MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+                Vec::new(),
+            )
+        } else {
+            let mut history = checkpoint.txo_block_history.clone();
+            if history.len() != height as usize {
+                anyhow::bail!(
+                    "TXO block history length {} does not match next height {height}",
+                    history.len()
+                );
+            }
+            history.push(evaluation.block_txo_root);
+            let txo_siblings = sparse_sha256_merkle_siblings(
+                &history,
+                height as usize,
+                TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+                TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+            )?;
+            (
+                MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+                history,
+            )
+        };
+
+        let mut pending_finalization = checkpoint.pending_finalization.clone();
+        pending_finalization.insert(height, BlockBufferCommitment::from_evaluation(&evaluation));
+        pending_finalization.remove(&finalized_height);
+        let next_checkpoint = PipelineCheckpoint {
+            height,
+            state_hex: hex::encode(new_state_bytes),
+            header_hex: hex::encode(new_header),
+            claim_frontier,
+            txo_block_frontier,
+            claim_history,
+            txo_block_history,
+            pending_finalization,
+        };
+        validate_checkpoint(&next_checkpoint)?;
         let prover_output = self
             .run_gen_proof(
                 height,
@@ -1076,71 +1176,7 @@ impl E2EBlockPipeline {
             .process_finalized_mints(&finalized_buffers, &uploaded_buffers)
             .await?;
 
-        let mut claim_history = self.checkpoint.claim_history.clone();
-        claim_history.extend_from_slice(&evaluation.deposit_leaf_hashes);
-        let claim_frontier = if let Some(last_leaf) = claim_history.last() {
-            let last_index = claim_history.len() - 1;
-            MerkleFrontier::new(
-                last_index as u32,
-                *last_leaf,
-                &sparse_sha256_merkle_siblings(
-                    &claim_history,
-                    last_index,
-                    AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
-                    0,
-                )?,
-            )
-        } else {
-            self.checkpoint.claim_frontier.clone()
-        };
-
-        let (txo_block_frontier, txo_block_history) =
-            if self.checkpoint.txo_block_history.is_empty() {
-                let txo_siblings = sequential_next_leaf_siblings(
-                    &self.checkpoint.txo_block_frontier,
-                    height,
-                    TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
-                    TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
-                    "TXO block frontier",
-                )?;
-                (
-                    MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
-                    Vec::new(),
-                )
-            } else {
-                let mut history = self.checkpoint.txo_block_history.clone();
-                if history.len() != height as usize {
-                    anyhow::bail!(
-                        "TXO block history length {} does not match next height {height}",
-                        history.len()
-                    );
-                }
-                history.push(evaluation.block_txo_root);
-                let txo_siblings = sparse_sha256_merkle_siblings(
-                    &history,
-                    height as usize,
-                    TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
-                    TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
-                )?;
-                (
-                    MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
-                    history,
-                )
-            };
-
-        let mut pending_finalization = self.checkpoint.pending_finalization.clone();
-        pending_finalization.insert(height, BlockBufferCommitment::from_evaluation(&evaluation));
-        pending_finalization.remove(&finalized_height);
-        self.checkpoint = PipelineCheckpoint {
-            height,
-            state_hex: hex::encode(new_state_bytes),
-            header_hex: hex::encode(new_header),
-            claim_frontier,
-            txo_block_frontier,
-            claim_history,
-            txo_block_history,
-            pending_finalization,
-        };
+        self.checkpoint = next_checkpoint;
         self.redis
             .set::<(), _, _>(
                 &self.checkpoint_key,
@@ -1914,84 +1950,7 @@ fn build_new_solana_header(
     Ok(new_header)
 }
 
-async fn run_gen_proof_one_shot(
-    config: &E2EBlockPipelineConfig,
-    old_state: &[u8],
-    witness: &[u8],
-    old_header: &[u8; HEADER_SIZE],
-    new_header: &[u8; HEADER_SIZE],
-) -> anyhow::Result<ProverOutput> {
-    prepare_prover_request(config, old_state, witness, old_header, new_header).await?;
-    let output = Command::new(&config.gen_proof_path)
-        .arg("--network")
-        .arg(config.network.as_str())
-        .arg("--old-state")
-        .arg(hex::encode(old_state))
-        .arg("--witness")
-        .arg(hex::encode(witness))
-        .arg("--custody-script-config")
-        .arg(hex::encode(config.custody_script_config))
-        .arg("--required-confirmations")
-        .arg(config.required_confirmations.to_string())
-        .arg("--flat-fee")
-        .arg(deposit_flat_fee(&config.config_params).to_string())
-        .arg("--fee-num")
-        .arg(deposit_fee_numerator(&config.config_params).to_string())
-        .arg("--fee-den")
-        .arg(deposit_fee_denominator(&config.config_params).to_string())
-        .arg("--old-header")
-        .arg(hex::encode(old_header))
-        .arg("--new-header")
-        .arg(hex::encode(new_header))
-        .arg("--config-params")
-        .arg(hex::encode(config.config_params))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "gen-proof failed with {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let prover_network = parse_prover_field(&output.stdout, "network")?;
-    if prover_network != config.network.as_str() {
-        anyhow::bail!(
-            "SP1 prover network mismatch: expected {}, got {prover_network}",
-            config.network.as_str()
-        );
-    }
-    let prover_elf_path = parse_prover_field(&output.stdout, "block_elf_path")?;
-    let prover_elf_sha256 = parse_prover_field(&output.stdout, "block_elf_sha256")?;
-    validate_prover_elf(config, prover_elf_path, prover_elf_sha256).await?;
-    let vk_hash = decode_prover_hash(
-        parse_prover_field(&output.stdout, "vkey_hash")?,
-        "SP1 program VK hash",
-    )?;
-    if vk_hash != config.expected_vk_hash {
-        anyhow::bail!(
-            "SP1 program VK mismatch: expected {}, got {}",
-            hex::encode(config.expected_vk_hash),
-            hex::encode(vk_hash)
-        );
-    }
-    Ok(ProverOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        vk_hash,
-    })
-}
 
-fn daemon_mode_unsupported(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
-    message.contains("unexpected argument '--daemon'")
-        || message.contains("unexpected argument '--network'")
-        || message.contains("daemon protocol stdout isolation requires Unix")
-}
 
 fn parse_prover_field<'a>(stdout: &'a [u8], field: &str) -> anyhow::Result<&'a str> {
     let stdout = std::str::from_utf8(stdout)?;
@@ -2520,6 +2479,25 @@ fn ensure_release_path(path: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+fn assert_checkpoint_matches_chain(
+    checkpoint: &PipelineCheckpoint,
+    chain_header: &PsyBridgeHeader,
+) -> anyhow::Result<()> {
+    let checkpoint_header = decode_fixed::<HEADER_SIZE>(&checkpoint.header_hex, "checkpoint header")?;
+    let chain_header_bytes: &[u8; HEADER_SIZE] = bytemuck::bytes_of(chain_header)
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("on-chain bridge header has an unexpected size"))?;
+    if checkpoint_header != *chain_header_bytes {
+        anyhow::bail!(
+            "Redis checkpoint height {} does not match the current on-chain bridge header; refusing to prove or submit from stale off-chain state",
+            checkpoint.height
+        );
+    }
+    Ok(())
+}
+
+
 fn validate_checkpoint(checkpoint: &PipelineCheckpoint) -> anyhow::Result<()> {
     ensure_length(
         "checkpoint header",
@@ -2610,6 +2588,7 @@ fn ensure_length(name: &str, bytes: &[u8], expected: usize) -> anyhow::Result<()
     }
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -2730,14 +2709,21 @@ mod tests {
         daemon.terminate().await;
     }
 
-    #[test]
-    fn unsupported_platform_daemon_falls_back_to_one_shot() {
-        let error = anyhow::anyhow!("daemon protocol stdout isolation requires Unix");
-        assert!(daemon_mode_unsupported(&error));
-    }
 
     const CUSTODY_SCRIPT_CONFIG: CustodyScriptConfig = CustodyScriptConfig::new([7u8; 32]);
     const RECIPIENT_ATA: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn stale_checkpoint_is_rejected_against_on_chain_header() {
+        let checkpoint = empty_checkpoint(42);
+        let chain_header = PsyBridgeHeader::default();
+        assert!(assert_checkpoint_matches_chain(&checkpoint, &chain_header).is_ok());
+
+        let mut stale = checkpoint;
+        stale.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let error = assert_checkpoint_matches_chain(&stale, &chain_header).unwrap_err();
+        assert!(error.to_string().contains("stale off-chain state"));
+    }
 
     fn empty_checkpoint(height: u32) -> PipelineCheckpoint {
         let claim_siblings: [QHash256; AUTO_CLAIM_DEPOSITS_TREE_HEIGHT] =

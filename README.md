@@ -1,6 +1,8 @@
-# Doge–Solana IBC Services and Integration E2E
+# Doge–Solana IBC Services
 
-This repository owns the cross-repository integration launcher, the full Dogecoin → Solana → Dogecoin E2E flow, and the current single-block update service. The current `e2e_block_pipeline` polls finalized Dogecoin blocks, builds real deposit witnesses, invokes the SP1 block-transition prover, submits the unique `block_update` through the isolated block sender, and processes finalized mint buffers.
+This repository owns the current single-block update service (`e2e_block_pipeline`) and a historical Redis-backed Dogecoin block-header relay prototype. Cross-repository local tooling and the complete Dogecoin → Solana → Dogecoin smoke flow live in the sibling `psy-doge-solana-cli` repository.
+
+The current `e2e_block_pipeline` polls finalized Dogecoin blocks, builds real deposit witnesses, invokes the SP1 block-transition prover, submits the unique `block_update` through the isolated block sender, and processes finalized mint buffers.
 
 The workspace also retains a historical Redis-backed Dogecoin block-header relay prototype: an Electrs client, work queues and state snapshots, a header notifier, a block processor, dummy proof workers, and an HTTP client for a separate legacy submitter.
 
@@ -8,49 +10,79 @@ Despite the historical `ibc` names, this is not a general IBC implementation. It
 
 ## Status and relationship to the current bridge
 
-The authoritative on-chain bridge is [`psy-doge-solana-bridge`](https://github.com/PsyProtocol/psy-doge-solana-bridge), production user/operator commands are released by `psy-doge-solana-cli`, and the SP1 workspace is `psy-bridge-sp1`. This repository owns block detection/proving/submission services and integration runtime orchestration around those components.
+The authoritative on-chain bridge is [`psy-doge-solana-bridge`](https://github.com/PsyProtocol/psy-doge-solana-bridge). Production operator commands and local Bun tooling are owned by `psy-doge-solana-cli`. The SP1 workspace is `psy-bridge-sp1`. This repository owns block detection/proving/submission services around those components.
 
 The legacy relay described after the current integration section is not compatible with the current bridge proof or account interfaces. In particular, its 260-byte `DogeBlockScryptProofOutput`, dummy workers, Redis schema, and historical submitter API are separate from the current SP1 block-transition pipeline.
 
-## Current integration E2E ownership
+## Current integration ownership
 
-The historical relay described below remains for reference, but `integration/e2e/` owns the current cross-repository launcher and full Dogecoin → Solana → Dogecoin integration flow. It discovers sibling repositories from the `solana-doge-ibc` checkout and consumes release binaries from `psy-doge-solana-cli`; the production CLI contains no launcher or E2E script.
+Local Bun tooling is owned by the sibling CLI:
 
-The current Rust `e2e_block_pipeline` is also integration-owned here. It polls finalized Dogecoin blocks, builds and verifies the real deposit witness, invokes the single block-transition SP1 `gen-proof`, uploads finalized mint/TXO buffers, submits the unique `block_update` through the isolated block sender, processes finalized mints, persists a Redis checkpoint, and writes content-addressed proof evidence.
+| Path | Role |
+| --- | --- |
+| `psy-doge-solana-cli/tools/local/launcher.ts` | Local environment launcher |
+| `psy-doge-solana-cli/tools/local/runner.ts` | Internal implementation behind `local-e2e` |
+| `psy-doge-solana-cli/tools/deploy/devnet.ts` | Devnet program deployment (separate) |
+
+Preferred complete local smoke entry:
+
+```bash
+doge-solana-cli --network localhost local-e2e
+```
+
+Global CLI syntax is always `doge-solana-cli --network localhost|devnet …`. This repository no longer ships Bun launcher/smoke entry points; run them from the CLI checkout to avoid dual-source drift.
+
+This repository continues to own the Rust `e2e_block_pipeline`. It polls finalized Dogecoin blocks, builds and verifies the real deposit witness, invokes the single block-transition SP1 `gen-proof`, uploads finalized mint/TXO buffers, submits the unique `block_update` through the isolated block sender, processes finalized mints, persists a Redis checkpoint, and writes content-addressed proof evidence.
 
 ### Focused local commands
 
-Run from the `solana-doge-ibc` repository root with the expected sibling checkouts (`psy-doge-solana-bridge`, `psy-doge-solana-cli`, `psy-bridge-sp1`, `dogecoin`, `electrs-doge`, and `solana-doge-bridge-block-sender`):
+Local tools (from a sibling checkout layout with `psy-doge-solana-cli` next to this repo):
 
 ```bash
-# Compile-check both Bun entry points.
-bun build integration/e2e/e2e_test.ts --target=bun --outfile=/tmp/solana-doge-ibc-e2e-test
-bun build integration/e2e/locSetupDoge.ts --target=bun --outfile=/tmp/solana-doge-ibc-local-launcher
+cd ../psy-doge-solana-cli
 
-# Source-level proof/evidence and atomic-withdrawal completion gates.
-bun integration/e2e/e2e_test.ts --self-test
+# Compile-check internal Bun tools.
+bun build tools/local/runner.ts --target=bun --outfile=/tmp/psy-doge-solana-cli-local-runner
+bun build tools/local/launcher.ts --target=bun --outfile=/tmp/psy-doge-solana-cli-local-launcher
 
 # Read-only launcher validation; no services are spawned.
-bun integration/e2e/locSetupDoge.ts --preflight --no-build
+bun tools/local/launcher.ts --network localhost --preflight --no-build
 
-# Non-destructive full-flow plan; completed remains false.
-bun integration/e2e/e2e_test.ts --dry-run
-
-# Explicitly gated live regtest. This starts the delegated-manager deployment,
-# prepares mature funding before the dynamic checkpoint, starts block sender +
-# IBC pipeline + local manager service, validates block-proof evidence, then
-# executes the atomic withdrawal through confirmed disc-17 finalize.
-bun integration/e2e/e2e_test.ts --full-live-regtest
+# Explicit complete local validation (may start dogecoind, Electrs, Solana validator,
+# IBC pipeline, SP1, Sender, and local Manager service).
+doge/target/release/doge-solana-cli --network localhost local-e2e
 ```
 
-Testnet/QED block ingestion uses the explicit profile and profile-specific embedded SP1 guest. Set the local bridge header/config/keypair values separately; `DOGE_START_HEIGHT` is the already-initialized checkpoint height, so the pipeline ingests `height+1` onward and can continue through `withdrawal_height+5`:
+Devnet operator commands use remote public endpoints and start **no** local
+processes (no dogecoind, Electrs, Solana validator, Manager service, Sender,
+IBC, Redis, or SP1). External Manager service availability is an operational
+prerequisite. Program deployment is separate:
+
+```bash
+cd ../psy-doge-solana-cli
+bun tools/deploy/devnet.ts --network devnet \
+  --payer /secure/payer.json \
+  --program-key-dir /secure/program-keys \
+  --preflight
+```
+
+Official Wormhole / Manager IDs on Solana devnet:
+
+| Component | ID |
+| --- | --- |
+| Wormhole Core | `3u8hJUVTA4jH1wYAyUur7FFZVQ8H635K3tSHHF4ssjQ5` |
+| Wormhole Shim | `EtZMZM22ViKMo4r5y4Anovs3wKQ2owUmDpjygnMMcdEX` |
+| Delegated Manager Set program | `wdmsTJP6YnsfeQjPuuEzGCrHmZvTmNy8VkxMCK8JkBX` |
+| Manager set index | `1` (official Wormhole set 1) |
+
+Testnet/QED block ingestion uses the explicit profile and profile-specific embedded SP1 guest. Set the local bridge header/config/keypair values separately; `DOGE_START_HEIGHT` is the already-initialized checkpoint height, so the pipeline ingests `height+1` onward:
 
 ```bash
 export DOGE_NETWORK=testnet
 export DOGE_ELECTRS_URL=https://doge-electrs-testnet-demo.qed.me
 export SP1_GEN_PROOF_PATH=../psy-bridge-sp1/target/release/gen-proof
 export SP1_BLOCK_ELF_PATH=../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition-testnet
-export SP1_BLOCK_VK_HASH=0007e438ca85c9ac7d1465df380f32fc37be58471a0c77a5c3fde317a108eb97
+export SP1_BLOCK_VK_HASH=006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd
 export DOGE_START_HEIGHT=<bridge-checkpoint-height>
 cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- \
   --network testnet \
@@ -61,7 +93,7 @@ cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- 
 
 The pipeline passes `--network testnet` to `gen-proof`, rejects any VK other than the testnet profile key, and checks both the canonical embedded ELF path and SHA-256 against `SP1_BLOCK_ELF_PATH` before accepting prover output.
 
-The live command requires prebuilt release artifacts. In particular, build `psy-doge-solana-cli/doge` release binaries, the SP1 `gen-proof` binary and block ELF, Dogecoin Core, electrs-doge, the bridge programs/CLI, and the block-sender distribution before using `--full-live-regtest`. The launcher intentionally uses `--no-build` in that flow so production repositories supply release artifacts while integration code owns runtime orchestration.
+Local CLI smoke requires prebuilt `doge-solana-cli`, Dogecoin Core, electrs-doge, and block-sender `dist/` artifacts. The launcher auto-builds a missing bridge CLI and SP1 `gen-proof`/guest ELF, and always rebuilds local Solana SBF programs with the exact `solprogram,noopshim,regtest-vk` profile before starting the isolated validator. Install the corresponding Rust/SP1 toolchains and `cargo-build-sbf`.
 
 ## Legacy relay workspace and package map
 
@@ -170,7 +202,7 @@ Removing that container also removes all queues, proof cache entries, and relay 
 
 Before starting the processor, supply a service at `http://localhost:3000` that implements the API contract in [Submitter HTTP API contract](#submitter-http-api-contract), including `x-api-key: doge-test-api-key`.
 
-The current integration launcher can start the sibling block sender for the real E2E command; the legacy manual sequence in this section still assumes that service is started separately.
+The sibling CLI localhost launcher can start the block sender for local smoke; the legacy manual sequence in this section still assumes that service is started separately.
 
 ### 5. Start the processor first
 
@@ -216,7 +248,7 @@ Run the dummy signature recovery example:
 cargo run --release --package qed_dsol_ibc_node_common --example g16_dummy_check
 ```
 
-The current pipeline has focused Rust tests, and the integration E2E has the Bun `--self-test` documented above. The legacy state-reader examples contain a fixed historical height and should only be used after editing them for the namespace/height being investigated.
+The current pipeline has focused Rust tests. Complete local validation is owned by `psy-doge-solana-cli` via the sole public entry `doge-solana-cli --network localhost local-e2e`. The legacy state-reader examples contain a fixed historical height and should only be used after editing them for the namespace/height being investigated.
 
 ## Hardcoded configuration
 
@@ -429,7 +461,7 @@ This is consistent with the implemented delivery model: destructive Redis pops, 
 
 ## Legacy relay security and operational limitations
 
-The following limitations apply to the historical notifier/processor/dummy-prover topology, not to the separately documented current integration contract:
+The following limitations apply to the historical notifier/processor/dummy-prover topology, not to the CLI-owned local tools (`tools/local/`) or the Rust `e2e_block_pipeline` documented above:
 
 - No production proof system is included in the legacy topology.
 - The legacy example API key and dummy signing key are public development constants.
