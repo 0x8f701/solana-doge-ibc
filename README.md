@@ -82,7 +82,7 @@ export DOGE_NETWORK=testnet
 export DOGE_ELECTRS_URL=https://doge-electrs-testnet-demo.qed.me
 export SP1_GEN_PROOF_PATH=../psy-bridge-sp1/target/release/gen-proof
 export SP1_BLOCK_ELF_PATH=../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release/block-transition-testnet
-export SP1_BLOCK_VK_HASH=006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd
+export SP1_BLOCK_VK_HASH=00b25e2fe5866751a38e5ca4d975b30b4187f3e0528a06dc86edc6e9a8b9cc02
 export DOGE_START_HEIGHT=<bridge-checkpoint-height>
 cargo run --release -p qed_dsol_ibc_node_common --example e2e_block_pipeline -- \
   --network testnet \

@@ -51,6 +51,7 @@ use psy_doge_bridge_helper::{
     data::core::{PsyDogeBridgeIncomingBlockWitness, PsyDogeBridgeState},
     tx_template::{
         get_manager_custody_output_script, get_manager_custody_redeem_script, CustodyScriptConfig,
+        LocalRegtestManagerCustody, ManagerCustodyProfile, OfficialTestnetManagerCustody,
         MANAGER_CUSTODY_REDEEM_SCRIPT_SIZE,
     },
     utils::sha256_zero_hashes::SHA256_ZERO_HASHES,
@@ -82,9 +83,9 @@ const PUBLIC_VALUES_SIZE: usize = 32;
 const CHECKPOINT_PREFIX: &str = "PDOGE-E2E-BLOCK-CHECKPOINT-V3";
 const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 pub const REGTEST_BLOCK_VK_HASH: [u8; 32] =
-    hex_literal::hex!("002ed3c169b6415db45e569dd01675bfb2ba89c59c7d26582f3a22d2ec313ee8");
+    hex_literal::hex!("001fa018c35d88136afe0e92bc9afe33ba94ca5dcd9156147adf004c7810e199");
 pub const TESTNET_BLOCK_VK_HASH: [u8; 32] =
-    hex_literal::hex!("006e4245bbde933878efc6f5d9673e0361a2c19872291b05f3c78361b98d35fd");
+    hex_literal::hex!("00b25e2fe5866751a38e5ca4d975b30b4187f3e0528a06dc86edc6e9a8b9cc02");
 
 const SOL_TIP_BLOCK_HASH: std::ops::Range<usize> = 0..32;
 const SOL_TIP_BLOCK_MERKLE_ROOT: std::ops::Range<usize> = 32..64;
@@ -138,6 +139,16 @@ impl DogeNetworkProfile {
             "../psy-bridge-sp1/target/elf-compilation/riscv64im-succinct-zkvm-elf/release",
         )
         .join(name)
+    }
+
+    /// Expected on-chain custodian wallet config hash for the selected
+    /// network's manager custody profile and the configured emitter PDA.
+    pub fn custodian_hash(self, emitter_bridge_pda: [u8; 32]) -> QHash256 {
+        let config = CustodyScriptConfig::new(emitter_bridge_pda);
+        match self {
+            Self::Regtest => config.hash::<LocalRegtestManagerCustody>(),
+            Self::Testnet => config.hash::<OfficialTestnetManagerCustody>(),
+        }
     }
 }
 
@@ -741,7 +752,7 @@ impl E2EBlockPipeline {
                 Pubkey::new_from_array(chain_state.access_control.operator_pubkey)
             );
         }
-        let expected_custodian_hash = CustodyScriptConfig::new(config.custody_script_config).hash();
+        let expected_custodian_hash = config.network.custodian_hash(config.custody_script_config);
         if chain_state.custodian_wallet_config_hash != expected_custodian_hash {
             anyhow::bail!(
                 "on-chain custodian wallet config hash {} does not match manager custody script config hash {}",
@@ -849,15 +860,16 @@ impl E2EBlockPipeline {
         if next_height > finalized_tip {
             return Ok(false);
         }
-
         match self.config.network {
             DogeNetworkProfile::Regtest => {
-                self.process_height::<DogeRegTestConfig>(next_height)
+                self.process_height::<DogeRegTestConfig, LocalRegtestManagerCustody>(next_height)
                     .await?
             }
             DogeNetworkProfile::Testnet => {
-                self.process_height::<DogeTestNetConfig>(next_height)
-                    .await?
+                self.process_height::<DogeTestNetConfig, OfficialTestnetManagerCustody>(
+                    next_height,
+                )
+                .await?
             }
         }
         Ok(true)
@@ -933,7 +945,10 @@ impl E2EBlockPipeline {
         }
     }
 
-    async fn process_height<NC: DogeNetworkConfig>(&mut self, height: u32) -> anyhow::Result<()> {
+    async fn process_height<NC: DogeNetworkConfig, P: ManagerCustodyProfile>(
+        &mut self,
+        height: u32,
+    ) -> anyhow::Result<()> {
         let checkpoint = self.checkpoint.clone();
         let generated_state_bytes = hex::decode(&checkpoint.state_hex)?;
         let old_state_bytes = read_optional_height_artifact(
@@ -963,7 +978,7 @@ impl E2EBlockPipeline {
             );
         }
         let custody_script_config = CustodyScriptConfig::new(self.config.custody_script_config);
-        validate_live_deposit_script(
+        validate_live_deposit_script::<P>(
             self.config.deposit_evidence_path.as_deref(),
             height,
             &block,
@@ -971,7 +986,7 @@ impl E2EBlockPipeline {
             &self.config.recipient_atas,
         )?;
 
-        let generated_witness = build_deposit_claim_witness(
+        let generated_witness = build_deposit_claim_witness::<P>(
             &block,
             &checkpoint,
             &custody_script_config,
@@ -990,7 +1005,7 @@ impl E2EBlockPipeline {
             anyhow::bail!("witness block header does not match Electrs block {height}");
         }
 
-        let evaluation = evaluate_claim_witness(
+        let evaluation = evaluate_claim_witness::<P>(
             height,
             &witness.claim_witness,
             witness.block_header.header.merkle_root,
@@ -1020,7 +1035,7 @@ impl E2EBlockPipeline {
             None,
         )?;
         let mut verified_state = old_state;
-        prover_guest_verify_block_transition_detailed::<NC>(
+        prover_guest_verify_block_transition_detailed::<NC, P>(
             custody_script_config,
             self.config.required_confirmations,
             witness.clone(),
@@ -1395,7 +1410,7 @@ struct DepositEvidenceCustody {
     redeem_script_hex: Option<String>,
 }
 
-fn validate_live_deposit_script(
+fn validate_live_deposit_script<P: ManagerCustodyProfile>(
     evidence_path: Option<&Path>,
     height: u32,
     block: &QDogeBlock,
@@ -1429,7 +1444,7 @@ fn validate_live_deposit_script(
         );
     }
     let expected_redeem_script =
-        get_manager_custody_redeem_script(custody_script_config, &recipient_ata);
+        get_manager_custody_redeem_script::<P>(custody_script_config, &recipient_ata);
     let actual_redeem_script = hex::decode(
         evidence
             .custody
@@ -1447,7 +1462,8 @@ fn validate_live_deposit_script(
             hex::encode(recipient_ata),
         );
     }
-    let expected_script = get_manager_custody_output_script(custody_script_config, &recipient_ata);
+    let expected_script =
+        get_manager_custody_output_script::<P>(custody_script_config, &recipient_ata);
     let actual_script = hex::decode(evidence.custody.script_pubkey_hex.as_deref().ok_or_else(
         || anyhow::anyhow!("confirmed deposit evidence is missing script_pubkey_hex"),
     )?)?;
@@ -1500,7 +1516,7 @@ fn decode_dogecoin_txid(value: &str) -> anyhow::Result<QHash256> {
     Ok(bytes)
 }
 
-fn build_deposit_claim_witness(
+fn build_deposit_claim_witness<P: ManagerCustodyProfile>(
     block: &QDogeBlock,
     checkpoint: &PipelineCheckpoint,
     custody_script_config: &CustodyScriptConfig,
@@ -1528,7 +1544,7 @@ fn build_deposit_claim_witness(
     let expected_scripts: Vec<[u8; 23]> = recipient_atas
         .iter()
         .map(|recipient_ata| {
-            get_manager_custody_output_script(custody_script_config, recipient_ata)
+            get_manager_custody_output_script::<P>(custody_script_config, recipient_ata)
         })
         .collect();
     let mut total_outputs = 0u32;
@@ -1632,7 +1648,7 @@ fn build_deposit_claim_witness(
     })
 }
 
-fn evaluate_claim_witness(
+fn evaluate_claim_witness<P: ManagerCustodyProfile>(
     block_height: u32,
     witness: &PsyBridgeClaimBlockWitness,
     block_transaction_tree_merkle_root: QHash256,
@@ -1641,7 +1657,7 @@ fn evaluate_claim_witness(
     deposit_fee_rate_numerator: u64,
     deposit_fee_rate_denominator: u64,
 ) -> anyhow::Result<ClaimEvaluation> {
-    let mut builder = BlockTransitionBuilder::new_from_siblings(
+    let mut builder = BlockTransitionBuilder::new_from_siblings::<P>(
         witness.header.total_outputs_hint as usize,
         flat_fee_per_deposit_sats,
         deposit_fee_rate_numerator,
@@ -2145,7 +2161,7 @@ async fn persist_evidence(
         fee_num: deposit_fee_numerator(&config.config_params),
         fee_den: deposit_fee_denominator(&config.config_params),
         config_params: hex::encode(config.config_params),
-        custodian_hash: hex::encode(CustodyScriptConfig::new(config.custody_script_config).hash()),
+        custodian_hash: hex::encode(config.network.custodian_hash(config.custody_script_config)),
         expected_vk_hash: hex::encode(config.expected_vk_hash),
         gen_proof_path: absolute_path(&config.gen_proof_path)?.display().to_string(),
         block_elf_source_path: absolute_path(&config.block_elf_path)?.display().to_string(),
@@ -2791,6 +2807,47 @@ mod tests {
     }
 
     #[test]
+    fn network_profiles_select_expected_manager_custody_hashes() {
+        // Shared Bridge State emitter PDA used by the official custody vectors.
+        const BRIDGE_STATE_PDA: [u8; 32] = hex_literal::hex!(
+            "f02732708965bb9473177495e608496b0af3bdbe5bd62ec062d8cddb1824a813"
+        );
+        const LOCAL_FIXTURE_HASH: [u8; 32] = hex_literal::hex!(
+            "6b6c33fa023611fdd672361f9c198353580959ad34af813af69178d61ca955eb"
+        );
+        const OFFICIAL_TESTNET_HASH: [u8; 32] = hex_literal::hex!(
+            "2621f9ac4de46226f85b48bcf2e20c87e6bb62ff946a9b12becb8c35a4e90ab0"
+        );
+
+        assert_eq!(
+            DogeNetworkProfile::Regtest.custodian_hash(BRIDGE_STATE_PDA),
+            LOCAL_FIXTURE_HASH
+        );
+        assert_eq!(
+            DogeNetworkProfile::Testnet.custodian_hash(BRIDGE_STATE_PDA),
+            OFFICIAL_TESTNET_HASH
+        );
+        assert_eq!(
+            CustodyScriptConfig::new(BRIDGE_STATE_PDA).hash::<LocalRegtestManagerCustody>(),
+            LOCAL_FIXTURE_HASH
+        );
+        assert_eq!(
+            CustodyScriptConfig::new(BRIDGE_STATE_PDA).hash::<OfficialTestnetManagerCustody>(),
+            OFFICIAL_TESTNET_HASH
+        );
+        assert_ne!(
+            get_manager_custody_output_script::<LocalRegtestManagerCustody>(
+                &CustodyScriptConfig::new(BRIDGE_STATE_PDA),
+                &RECIPIENT_ATA,
+            ),
+            get_manager_custody_output_script::<OfficialTestnetManagerCustody>(
+                &CustodyScriptConfig::new(BRIDGE_STATE_PDA),
+                &RECIPIENT_ATA,
+            )
+        );
+    }
+
+    #[test]
     fn high_checkpoint_frontier_advances_without_full_history() {
         let height = 67_765_166;
         let checkpoint = empty_checkpoint(height);
@@ -2847,7 +2904,7 @@ mod tests {
         };
         let block = rpc.get_qd_block(BLOCK_HEIGHT).await.unwrap();
         assert_eq!(block.header.previous_block_hash, state.get_tip_block_hash());
-        let witness = build_deposit_claim_witness(
+        let witness = build_deposit_claim_witness::<OfficialTestnetManagerCustody>(
             &block,
             &checkpoint,
             &CUSTODY_SCRIPT_CONFIG,
@@ -2857,7 +2914,10 @@ mod tests {
         let witness_bytes = witness.write_to_vec().unwrap();
         let old_state_bytes = borsh::to_vec(&state).unwrap();
         let mut verified_state = state;
-        prover_guest_verify_block_transition_detailed::<DogeTestNetConfig>(
+        prover_guest_verify_block_transition_detailed::<
+            DogeTestNetConfig,
+            OfficialTestnetManagerCustody,
+        >(
             CUSTODY_SCRIPT_CONFIG,
             1,
             witness,
@@ -2907,16 +2967,16 @@ mod tests {
         }]);
         let deposit_amount = 100_000_000;
         let redeem_script =
-            get_manager_custody_redeem_script(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
+            get_manager_custody_redeem_script::<LocalRegtestManagerCustody>(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
         assert_eq!(redeem_script.len(), MANAGER_CUSTODY_REDEEM_SCRIPT_SIZE);
         let deposit = transaction(vec![BTCTransactionOutput {
             value: deposit_amount,
-            script: get_manager_custody_output_script(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA)
+            script: get_manager_custody_output_script::<LocalRegtestManagerCustody>(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA)
                 .to_vec(),
         }]);
         let block = block(height, vec![coinbase, deposit]);
 
-        let witness = build_deposit_claim_witness(
+        let witness = build_deposit_claim_witness::<LocalRegtestManagerCustody>(
             &block,
             &checkpoint,
             &CUSTODY_SCRIPT_CONFIG,
@@ -2930,7 +2990,7 @@ mod tests {
             1
         );
 
-        let evaluation = evaluate_claim_witness(
+        let evaluation = evaluate_claim_witness::<LocalRegtestManagerCustody>(
             height,
             &witness.claim_witness,
             block.header.merkle_root,
@@ -2986,7 +3046,7 @@ mod tests {
             }])],
         );
 
-        let witness = build_deposit_claim_witness(
+        let witness = build_deposit_claim_witness::<LocalRegtestManagerCustody>(
             &block,
             &checkpoint,
             &CUSTODY_SCRIPT_CONFIG,
@@ -3003,7 +3063,7 @@ mod tests {
         let height = 103;
         let deposit = transaction(vec![BTCTransactionOutput {
             value: 100_000_000,
-            script: get_manager_custody_output_script(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA)
+            script: get_manager_custody_output_script::<LocalRegtestManagerCustody>(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA)
                 .to_vec(),
         }]);
         let txid = {
@@ -3020,8 +3080,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("deposit.json");
         let exact_redeem =
-            get_manager_custody_redeem_script(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
-        let output = get_manager_custody_output_script(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
+            get_manager_custody_redeem_script::<LocalRegtestManagerCustody>(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
+        let output = get_manager_custody_output_script::<LocalRegtestManagerCustody>(&CUSTODY_SCRIPT_CONFIG, &RECIPIENT_ATA);
         let evidence = serde_json::json!({
             "deposit": { "txid": txid, "vout": 0, "confirmation_height": height },
             "custody": {
@@ -3031,7 +3091,7 @@ mod tests {
             }
         });
         std::fs::write(&path, serde_json::to_vec(&evidence).unwrap()).unwrap();
-        validate_live_deposit_script(
+        validate_live_deposit_script::<LocalRegtestManagerCustody>(
             Some(&path),
             height,
             &block,
@@ -3049,7 +3109,7 @@ mod tests {
             }
         });
         std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-        validate_live_deposit_script(
+        validate_live_deposit_script::<LocalRegtestManagerCustody>(
             Some(&path),
             height,
             &block,
@@ -3069,7 +3129,7 @@ mod tests {
             }
         });
         std::fs::write(&path, serde_json::to_vec(&evidence).unwrap()).unwrap();
-        let error = validate_live_deposit_script(
+        let error = validate_live_deposit_script::<LocalRegtestManagerCustody>(
             Some(&path),
             height,
             &block,
@@ -3093,14 +3153,14 @@ mod tests {
         }]);
         let block = block(height, vec![ordinary]);
 
-        let witness = build_deposit_claim_witness(
+        let witness = build_deposit_claim_witness::<LocalRegtestManagerCustody>(
             &block,
             &checkpoint,
             &CUSTODY_SCRIPT_CONFIG,
             &[RECIPIENT_ATA],
         )
         .unwrap();
-        let evaluation = evaluate_claim_witness(
+        let evaluation = evaluate_claim_witness::<LocalRegtestManagerCustody>(
             height,
             &witness.claim_witness,
             block.header.merkle_root,
