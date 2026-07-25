@@ -1,16 +1,20 @@
 use std::{
     collections::BTreeMap,
+    future::Future,
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, AtomicU8, Ordering},
+        Arc,
+    },
     time::Duration,
 };
-
-use borsh::BorshDeserialize;
 use doge_bridge_client::{
-    BridgeApi, BridgeClient, BridgeClientConfigBuilder, PendingMint, PsyBridgeHeader,
+    BridgeApi, BridgeClient, BridgeClientConfigBuilder, BridgeError, PendingMint,
+    ProcessMintsResult, PsyBridgeHeader,
 };
+use borsh::BorshDeserialize;
 use doge_light_client::{
     chain_state::QEDDogeChainStateCore,
     common_types::QHash256,
@@ -57,7 +61,7 @@ use psy_doge_bridge_helper::{
     utils::sha256_zero_hashes::SHA256_ZERO_HASHES,
 };
 use serde::{Deserialize, Serialize};
-use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
+use solana_client::{client_error::ClientErrorKind, nonblocking::rpc_client::RpcClient as SolanaRpcClient};
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     pubkey::Pubkey,
@@ -70,17 +74,17 @@ use tokio::task::JoinHandle;
 
 use crate::{
     doge_link_rpc_async::DogeLinkElectrsAsyncClient,
+    network_retry::{has_retryable_io_source, is_retryable_reqwest, NetworkRetryPolicy, RetryAction},
     sol_submitter::{BlockUpdateRequestBody, SolSubmitterClient},
 };
 
-const PROOF_PATH: &str = "/tmp/bridge-block-transition-proof.bin";
-const PUBLIC_VALUES_PATH: &str = "/tmp/bridge-block-transition-pubvals.bin";
 const HEADER_SIZE: usize = 320;
 const CONFIG_SIZE: usize = 48;
 const CUSTODY_SCRIPT_CONFIG_SIZE: usize = 32;
 const PROOF_SIZE: usize = 356;
 const PUBLIC_VALUES_SIZE: usize = 32;
 const CHECKPOINT_PREFIX: &str = "PDOGE-E2E-BLOCK-CHECKPOINT-V3";
+const CHECKPOINT_JOURNAL_SUFFIX: &str = "pending";
 const EVIDENCE_SCHEMA_VERSION: u32 = 2;
 pub const REGTEST_BLOCK_VK_HASH: [u8; 32] =
     hex_literal::hex!("001fa018c35d88136afe0e92bc9afe33ba94ca5dcd9156147adf004c7810e199");
@@ -141,6 +145,15 @@ impl DogeNetworkProfile {
         .join(name)
     }
 
+    /// Stable path-independent SP1 guest identifier reported by the gen-proof
+    /// daemon. The pipeline validates the daemon identity by this id plus the
+    /// embedded ELF SHA-256 and verifying key, not by the daemon's local path.
+    pub const fn guest_id(self) -> &'static str {
+        match self {
+            Self::Regtest => "block-transition",
+            Self::Testnet => "block-transition-testnet",
+        }
+    }
     /// Expected on-chain custodian wallet config hash for the selected
     /// network's manager custody profile and the configured emitter PDA.
     pub fn custodian_hash(self, emitter_bridge_pda: [u8; 32]) -> QHash256 {
@@ -153,7 +166,7 @@ impl DogeNetworkProfile {
 }
 
 #[derive(Debug, Clone)]
-pub struct E2EBlockPipelineConfig {
+pub struct BlockPipelineConfig {
     pub network: DogeNetworkProfile,
     pub electrs_url: String,
     pub redis_url: String,
@@ -303,6 +316,43 @@ struct PipelineCheckpoint {
     pending_finalization: BTreeMap<u32, BlockBufferCommitment>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointJournal {
+    checkpoint: PipelineCheckpoint,
+    #[serde(default)]
+    uploaded_buffers: Option<UploadedBuffers>,
+    /// The finalized source-height buffer commitment that was removed from
+    /// `checkpoint.pending_finalization`. It is required to re-run mint
+    /// recovery after a crash that follows `block_update`.
+    #[serde(default)]
+    finalized_commitment: Option<BlockBufferCommitment>,
+    /// Sender signature for the committed `block_update`, persisted once the
+    /// sender accepts the submission.
+    #[serde(default)]
+    submission_signature: Option<String>,
+    /// Mint processing progress, persisted once all mint groups are
+    /// processed. Its presence means the height is fully recovered.
+    #[serde(default)]
+    mint_progress: Option<MintProgressRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MintProgressRecord {
+    signatures: Vec<String>,
+    groups_processed: usize,
+    total_mints_processed: usize,
+}
+
+impl From<&MintProcessingEvidence> for MintProgressRecord {
+    fn from(evidence: &MintProcessingEvidence) -> Self {
+        Self {
+            signatures: evidence.signatures.clone(),
+            groups_processed: evidence.groups_processed,
+            total_mints_processed: evidence.total_mints_processed,
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceArtifact {
@@ -363,6 +413,8 @@ struct ProverOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     vk_hash: [u8; 32],
+    proof: Vec<u8>,
+    public_values: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -380,7 +432,7 @@ impl std::error::Error for ProverRequestError {}
 struct ProverIdentityResponse {
     kind: String,
     network: String,
-    block_elf_path: String,
+    guest_id: String,
     block_elf_sha256: String,
     vkey_hash: String,
 }
@@ -388,16 +440,16 @@ struct ProverIdentityResponse {
 #[derive(Debug, Deserialize)]
 struct ProverProofResponse {
     kind: String,
-    request_id: String,
+    // The daemon always tags a successful proof response with `request_id`;
+    // an error response may omit it, so deserialize both via `Option`.
+    request_id: Option<String>,
     ok: bool,
     network: Option<String>,
-    block_elf_path: Option<String>,
+    guest_id: Option<String>,
     block_elf_sha256: Option<String>,
     vkey_hash: Option<String>,
-    proof_path: Option<String>,
     proof_size: Option<usize>,
     proof_bytes: Option<String>,
-    public_values_path: Option<String>,
     public_values_size: Option<usize>,
     public_values: Option<String>,
     error: Option<String>,
@@ -419,6 +471,51 @@ struct ProverProofRequest<'a> {
 }
 
 const MAX_PROVER_DIAGNOSTICS_BYTES: usize = 256 * 1024;
+/// SP1 daemon phase budgets passed explicitly to `gen-proof` so the IBC and
+/// the prover share one timeout contract. The daemon self-exits 75 on its own
+/// phase timeout; the IBC deadlines below are strictly larger than these so a
+/// normal long proof is never killed before the daemon's own deadline.
+const SP1_SETUP_TIMEOUT_SECS: u64 = 600;
+const SP1_EXECUTE_TIMEOUT_SECS: u64 = 900;
+const SP1_PROVE_TIMEOUT_SECS: u64 = 7_200;
+/// Headroom applied on top of the SP1 phase budgets when deriving IBC
+/// deadlines, so the IBC never fires before the daemon's own timeout.
+const PROVER_DEADLINE_HEADROOM_SECS: u64 = 300;
+/// IBC identity budget: SP1 setup + headroom.
+const PROVER_IDENTITY_DEADLINE: Duration =
+    Duration::from_secs(SP1_SETUP_TIMEOUT_SECS + PROVER_DEADLINE_HEADROOM_SECS);
+/// Per-attempt budget for writing a proof request line to the daemon stdin.
+const PROVER_STDIN_WRITE_DEADLINE: Duration = Duration::from_secs(60);
+/// Per-attempt budget for reading a single proof response line. Covers the
+/// daemon's execute + prove phases plus headroom.
+const PROVER_RESPONSE_DEADLINE: Duration = Duration::from_secs(
+    SP1_EXECUTE_TIMEOUT_SECS + SP1_PROVE_TIMEOUT_SECS + PROVER_DEADLINE_HEADROOM_SECS,
+);
+/// Overall budget for a single proof attempt (stdin write + response read).
+const PROVER_PROOF_DEADLINE: Duration = Duration::from_secs(
+    60 + SP1_EXECUTE_TIMEOUT_SECS + SP1_PROVE_TIMEOUT_SECS + PROVER_DEADLINE_HEADROOM_SECS,
+);
+/// Overall wall-clock watchdog for a single `poll_once` iteration. Covers the
+/// identity/setup phase plus at most two proof attempts (run_gen_proof
+/// restarts the daemon once), then buffer upload, sender submission, and
+/// mint processing, with headroom. This must exceed a single normal proof so
+/// the watchdog never kills a healthy prove.
+const POLL_ONCE_WATCHDOG: Duration = Duration::from_secs(
+    (SP1_SETUP_TIMEOUT_SECS + PROVER_DEADLINE_HEADROOM_SECS)
+        + 2 * (60 + SP1_EXECUTE_TIMEOUT_SECS + SP1_PROVE_TIMEOUT_SECS + PROVER_DEADLINE_HEADROOM_SECS)
+        + 1_800,
+);
+/// Redis TCP/TLS connection and internal-command budget.
+const REDIS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget applied to every Redis command by fred's `default_command_timeout`.
+const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max time a frame may wait without a response before fred closes the
+/// connection as unresponsive and reconnects.
+const REDIS_UNRESPONSIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Top-level deadline for Redis pool initialization.
+const REDIS_INIT_DEADLINE: Duration = Duration::from_secs(30);
+/// Top-level deadline for critical Redis checkpoint read/write operations.
+const REDIS_CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
 
 struct ProverDaemon {
     child: Child,
@@ -430,12 +527,18 @@ struct ProverDaemon {
 }
 
 impl ProverDaemon {
-    async fn start(config: &E2EBlockPipelineConfig) -> anyhow::Result<Self> {
+    async fn start(config: &BlockPipelineConfig) -> anyhow::Result<Self> {
         let mut command = Command::new(&config.gen_proof_path);
         command
             .arg("--network")
             .arg(config.network.as_str())
             .arg("--daemon")
+            .arg("--setup-timeout-secs")
+            .arg(SP1_SETUP_TIMEOUT_SECS.to_string())
+            .arg("--execute-timeout-secs")
+            .arg(SP1_EXECUTE_TIMEOUT_SECS.to_string())
+            .arg("--prove-timeout-secs")
+            .arg(SP1_PROVE_TIMEOUT_SECS.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -480,7 +583,10 @@ impl ProverDaemon {
             stderr_task: Some(stderr_task),
             vk_hash: [0; 32],
         };
-        let identity_line = match daemon.read_response_line().await {
+        let identity_line = match daemon
+            .read_response_line_within(PROVER_IDENTITY_DEADLINE)
+            .await
+        {
             Ok(line) => line,
             Err(error) => {
                 let _ = daemon.child.kill().await;
@@ -521,7 +627,7 @@ impl ProverDaemon {
 
     async fn prove(
         &mut self,
-        config: &E2EBlockPipelineConfig,
+        config: &BlockPipelineConfig,
         request_id: &str,
         old_state: &[u8],
         witness: &[u8],
@@ -543,10 +649,26 @@ impl ProverDaemon {
         };
         let mut request_line = serde_json::to_vec(&request)?;
         request_line.push(b'\n');
-        self.stdin.write_all(&request_line).await?;
-        self.stdin.flush().await?;
 
-        let response_line = self.read_response_line().await?;
+        let response_line = tokio::time::timeout(PROVER_PROOF_DEADLINE, async {
+            tokio::time::timeout(
+                PROVER_STDIN_WRITE_DEADLINE,
+                self.stdin.write_all(&request_line),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("gen-proof daemon stdin write timed out after {PROVER_STDIN_WRITE_DEADLINE:?}"))??;
+            tokio::time::timeout(PROVER_STDIN_WRITE_DEADLINE, self.stdin.flush())
+                .await
+                .map_err(|_| anyhow::anyhow!("gen-proof daemon stdin flush timed out after {PROVER_STDIN_WRITE_DEADLINE:?}"))??;
+
+            self.read_response_line_within(PROVER_RESPONSE_DEADLINE)
+                .await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("gen-proof request {request_id} timed out after {PROVER_PROOF_DEADLINE:?}")
+        })??;
+
         let response: ProverProofResponse = serde_json::from_slice(&response_line)
             .map_err(|error| anyhow::anyhow!("malformed gen-proof response: {error}"))?;
         if response.kind != "proof" {
@@ -555,16 +677,30 @@ impl ProverDaemon {
                 response.kind
             );
         }
-        if response.request_id != request_id {
+        if response.request_id.as_deref() != Some(request_id) {
             anyhow::bail!(
-                "gen-proof response request id '{}' did not match '{request_id}'",
+                "gen-proof response request id {:?} did not match '{request_id}'",
                 response.request_id
             );
         }
         if !response.ok {
+            let error_message = response
+                .error
+                .as_deref()
+                .unwrap_or("missing error message")
+                .to_owned();
+            // A daemon-reported timeout (the SP1 process exits 75 after a
+            // CUDA phase timeout) is recoverable by restarting the daemon
+            // once. Surface it as a plain timeout error rather than a fatal
+            // ProverRequestError so run_gen_proof kills and restarts the
+            // daemon; other daemon-reported failures fail closed.
+            if error_message.contains("timed out") {
+                return Err(anyhow::anyhow!(
+                    "gen-proof request {request_id} timed out: {error_message}"
+                ));
+            }
             return Err(anyhow::Error::new(ProverRequestError(format!(
-                "gen-proof request {request_id} failed: {}",
-                response.error.as_deref().unwrap_or("missing error message")
+                "gen-proof request {request_id} failed: {error_message}"
             ))));
         }
         validate_proof_response(config, self.vk_hash, &response)?;
@@ -585,13 +721,13 @@ impl ProverDaemon {
                 public_values.len()
             );
         }
-        tokio::fs::write(PROOF_PATH, proof).await?;
-        tokio::fs::write(PUBLIC_VALUES_PATH, public_values).await?;
         let stderr = self.take_stderr().await;
         Ok(ProverOutput {
             stdout: response_line,
             stderr,
             vk_hash: self.vk_hash,
+            proof,
+            public_values,
         })
     }
 
@@ -635,6 +771,19 @@ impl ProverDaemon {
                 diagnostics.drain(..keep_from);
             }
         }
+    }
+
+    /// Read the next protocol response line, bounded by a hard wall-clock
+    /// deadline so an alive-but-silent daemon cannot block the pipeline.
+    async fn read_response_line_within(
+        &mut self,
+        deadline: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
+        tokio::time::timeout(deadline, self.read_response_line())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("gen-proof daemon did not respond within {deadline:?}")
+            })?
     }
 
     async fn take_stderr(&self) -> Vec<u8> {
@@ -691,6 +840,7 @@ struct ProverInputsEvidence {
     new_header_sha256: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadedBuffers {
     mint_buffer: Pubkey,
     mint_buffer_bump: u8,
@@ -704,8 +854,8 @@ struct MintProcessingEvidence {
     total_mints_processed: usize,
 }
 
-pub struct E2EBlockPipeline {
-    config: E2EBlockPipelineConfig,
+pub struct BlockPipeline {
+    config: BlockPipelineConfig,
     block_rpc: DogeLinkElectrsAsyncClient,
     sender: SolSubmitterClient,
     bridge_client: BridgeClient,
@@ -713,19 +863,16 @@ pub struct E2EBlockPipeline {
     checkpoint_key: String,
     checkpoint: PipelineCheckpoint,
     prover: ProverProcess,
+    network_retry: NetworkRetryPolicy,
 }
 
-impl E2EBlockPipeline {
-    pub async fn initialize(config: E2EBlockPipelineConfig) -> anyhow::Result<Self> {
+impl BlockPipeline {
+    pub async fn initialize(config: BlockPipelineConfig) -> anyhow::Result<Self> {
         validate_config(&config)?;
-        let redis_config = Config::from_url(&config.redis_url)?;
-        let redis = Builder::from_config(redis_config)
-            .with_connection_config(|connection| {
-                connection.connection_timeout = Duration::from_secs(10);
-            })
-            .set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2))
-            .build_pool(2)?;
-        redis.init().await?;
+        let redis = build_redis_pool(&config)?;
+        tokio::time::timeout(REDIS_INIT_DEADLINE, redis.init())
+            .await
+            .map_err(|_| anyhow::anyhow!("redis init exceeded {REDIS_INIT_DEADLINE:?}"))??;
         let operator = read_pipeline_keypair(&config.operator_keypair, "operator")?;
         let operator_pubkey = operator.pubkey();
         let payer = read_pipeline_keypair(&config.payer_keypair, "payer")?;
@@ -745,7 +892,11 @@ impl E2EBlockPipeline {
                 .wormhole_shim_program_id(config.bridge_program)
                 .build()?,
         )?;
-        let chain_state = bridge_client.get_current_bridge_state().await?;
+        let network_retry = NetworkRetryPolicy::default();
+        let chain_state = retry_bridge_network(network_retry, "Solana bridge-state lookup", || {
+            bridge_client.get_current_bridge_state()
+        })
+        .await?;
         if chain_state.access_control.operator_pubkey != operator_pubkey.to_bytes() {
             anyhow::bail!(
                 "configured operator {operator_pubkey} does not match on-chain operator {}",
@@ -774,11 +925,25 @@ impl E2EBlockPipeline {
             config.redis_seed
         );
         let block_rpc = DogeLinkElectrsAsyncClient::new(config.electrs_url.clone());
-        let checkpoint = match redis.get::<Option<String>, _>(&checkpoint_key).await? {
+        let checkpoint = match tokio::time::timeout(
+            REDIS_CHECKPOINT_DEADLINE,
+            redis.get::<Option<String>, _>(&checkpoint_key),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("redis checkpoint load exceeded {REDIS_CHECKPOINT_DEADLINE:?}"))??
+        {
             Some(value) => serde_json::from_str(&value)?,
             None => initialize_checkpoint(&config, &block_rpc).await?,
         };
-        validate_checkpoint(&checkpoint)?;
+        let checkpoint = reconcile_checkpoint_journal(
+            &redis,
+            &checkpoint_key,
+            checkpoint,
+            &chain_state.bridge_header,
+            &bridge_client,
+            network_retry,
+        )
+        .await?;
         assert_checkpoint_matches_chain(&checkpoint, &chain_state.bridge_header)?;
 
         let prover = ProverProcess::Daemon(ProverDaemon::start(&config).await?);
@@ -801,6 +966,7 @@ impl E2EBlockPipeline {
             checkpoint,
             config,
             prover,
+            network_retry,
         })
     }
 
@@ -850,29 +1016,60 @@ impl E2EBlockPipeline {
     }
 
     pub async fn poll_once(&mut self) -> anyhow::Result<bool> {
-        let electrs_tip = self.block_rpc.get_block_height().await?;
-        let finalized_tip = electrs_tip.saturating_sub(self.config.required_confirmations);
-        let next_height = self
-            .checkpoint
-            .height
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
-        if next_height > finalized_tip {
-            return Ok(false);
-        }
-        match self.config.network {
-            DogeNetworkProfile::Regtest => {
-                self.process_height::<DogeRegTestConfig, LocalRegtestManagerCustody>(next_height)
+        // Overall wall-clock watchdog for a single poll. The phase label and
+        // the in-flight height are surfaced in the watchdog error so an
+        // operator can see where the pipeline stalled without per-step
+        // diagnostic logging.
+        const PHASE_FETCH_TIP: u8 = 0;
+        const PHASE_PROCESS_HEIGHT: u8 = 1;
+        const POLL_PHASE_NAMES: [&str; 2] = ["fetch-electrs-tip", "process-height"];
+        let phase = Arc::new(AtomicU8::new(PHASE_FETCH_TIP));
+        let in_flight_height = Arc::new(AtomicU32::new(0));
+        let body_phase = Arc::clone(&phase);
+        let body_height = Arc::clone(&in_flight_height);
+
+        let body = async move {
+            body_phase.store(PHASE_FETCH_TIP, Ordering::Relaxed);
+            let electrs_tip = self.block_rpc.get_block_height().await?;
+            let finalized_tip = electrs_tip.saturating_sub(self.config.required_confirmations);
+            let next_height = self
+                .checkpoint
+                .height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
+            body_height.store(next_height, Ordering::Relaxed);
+            if next_height > finalized_tip {
+                return Ok(false);
+            }
+            body_phase.store(PHASE_PROCESS_HEIGHT, Ordering::Relaxed);
+            match self.config.network {
+                DogeNetworkProfile::Regtest => {
+                    self.process_height::<DogeRegTestConfig, LocalRegtestManagerCustody>(
+                        next_height,
+                    )
                     .await?
+                }
+                DogeNetworkProfile::Testnet => {
+                    self.process_height::<DogeTestNetConfig, OfficialTestnetManagerCustody>(
+                        next_height,
+                    )
+                    .await?
+                }
             }
-            DogeNetworkProfile::Testnet => {
-                self.process_height::<DogeTestNetConfig, OfficialTestnetManagerCustody>(
-                    next_height,
-                )
-                .await?
+            Ok(true)
+        };
+
+        tokio::select! {
+            biased;
+            result = body => result,
+            _ = tokio::time::sleep(POLL_ONCE_WATCHDOG) => {
+                let phase_name = POLL_PHASE_NAMES[phase.load(Ordering::Relaxed) as usize];
+                let height = in_flight_height.load(Ordering::Relaxed);
+                Err(anyhow::anyhow!(
+                    "block pipeline poll_once watchdog exceeded {POLL_ONCE_WATCHDOG:?} at height {height} phase {phase_name}"
+                ))
             }
         }
-        Ok(true)
     }
 
     async fn run_gen_proof(
@@ -1123,6 +1320,22 @@ impl E2EBlockPipeline {
             pending_finalization,
         };
         validate_checkpoint(&next_checkpoint)?;
+        let journal_key = checkpoint_journal_key(&self.checkpoint_key);
+        self.redis
+            .set::<(), _, _>(
+                &journal_key,
+                serde_json::to_string(&CheckpointJournal {
+                    checkpoint: next_checkpoint.clone(),
+                    uploaded_buffers: None,
+                    finalized_commitment: Some(finalized_buffers.clone()),
+                    submission_signature: None,
+                    mint_progress: None,
+                })?,
+                None,
+                None,
+                false,
+            )
+            .await?;
         let prover_output = self
             .run_gen_proof(
                 height,
@@ -1133,10 +1346,10 @@ impl E2EBlockPipeline {
             )
             .await?;
 
-        let proof = tokio::fs::read(PROOF_PATH).await?;
-        let public_values = tokio::fs::read(PUBLIC_VALUES_PATH).await?;
-        ensure_length("SP1 proof", &proof, PROOF_SIZE)?;
-        ensure_length("SP1 public values", &public_values, PUBLIC_VALUES_SIZE)?;
+        let proof = &prover_output.proof;
+        let public_values = &prover_output.public_values;
+        ensure_length("SP1 proof", proof, PROOF_SIZE)?;
+        ensure_length("SP1 public values", public_values, PUBLIC_VALUES_SIZE)?;
         if proof.iter().all(|byte| *byte == 0) {
             anyhow::bail!("SP1 proof is an all-zero placeholder");
         }
@@ -1148,6 +1361,21 @@ impl E2EBlockPipeline {
         let uploaded_buffers = self
             .upload_finalized_buffers(finalized_height, &finalized_buffers)
             .await?;
+        self.redis
+            .set::<(), _, _>(
+                &journal_key,
+                serde_json::to_string(&CheckpointJournal {
+                    checkpoint: next_checkpoint.clone(),
+                    uploaded_buffers: Some(uploaded_buffers.clone()),
+                    finalized_commitment: Some(finalized_buffers.clone()),
+                    submission_signature: None,
+                    mint_progress: None,
+                })?,
+                None,
+                None,
+                false,
+            )
+            .await?;
         let mut evidence = persist_evidence(
             &self.config,
             height,
@@ -1157,8 +1385,8 @@ impl E2EBlockPipeline {
             &witness_bytes,
             &old_header,
             &new_header,
-            &proof,
-            &public_values,
+            proof,
+            public_values,
             &prover_output,
             &evaluation,
             &finalized_buffers,
@@ -1172,7 +1400,7 @@ impl E2EBlockPipeline {
             .sender
             .block_update(&BlockUpdateRequestBody {
                 idempotency_key: idempotency_key.clone(),
-                proof_hex: hex::encode(&proof),
+                proof_hex: hex::encode(proof),
                 header_hex: hex::encode(new_header),
                 mint_buffer: uploaded_buffers.mint_buffer.to_string(),
                 txo_buffer: uploaded_buffers.txo_buffer.to_string(),
@@ -1187,10 +1415,43 @@ impl E2EBlockPipeline {
                 idempotency_key
             );
         }
+        // Persist the accepted block_update signature so a crash between
+        // here and mint completion can reconcile without resubmitting.
+        self.redis
+            .set::<(), _, _>(
+                &journal_key,
+                serde_json::to_string(&CheckpointJournal {
+                    checkpoint: next_checkpoint.clone(),
+                    uploaded_buffers: Some(uploaded_buffers.clone()),
+                    finalized_commitment: Some(finalized_buffers.clone()),
+                    submission_signature: Some(response.signature.clone()),
+                    mint_progress: None,
+                })?,
+                None,
+                None,
+                false,
+            )
+            .await?;
         let mint_processing = self
             .process_finalized_mints(&finalized_buffers, &uploaded_buffers)
             .await?;
-
+        // Persist mint progress so a crash after this point promotes the
+        // checkpoint directly on recovery instead of re-running mints.
+        self.redis
+            .set::<(), _, _>(
+                &journal_key,
+                serde_json::to_string(&CheckpointJournal {
+                    checkpoint: next_checkpoint.clone(),
+                    uploaded_buffers: Some(uploaded_buffers.clone()),
+                    finalized_commitment: Some(finalized_buffers.clone()),
+                    submission_signature: Some(response.signature.clone()),
+                    mint_progress: Some(MintProgressRecord::from(&mint_processing)),
+                })?,
+                None,
+                None,
+                false,
+            )
+            .await?;
         self.checkpoint = next_checkpoint;
         self.redis
             .set::<(), _, _>(
@@ -1200,6 +1461,9 @@ impl E2EBlockPipeline {
                 None,
                 false,
             )
+            .await?;
+        self.redis
+            .del::<(), _>(&journal_key)
             .await?;
 
         evidence.status = "minted".to_owned();
@@ -1223,14 +1487,24 @@ impl E2EBlockPipeline {
             .collect();
         validate_buffer_payload(finalized, &pending_mints)?;
         self.ensure_recipient_token_accounts(&pending_mints).await?;
-        let (mint_buffer, mint_buffer_bump) = self
-            .bridge_client
-            .setup_pending_mints_buffer(finalized_height, &pending_mints)
-            .await?;
-        let (txo_buffer, txo_buffer_bump) = self
-            .bridge_client
-            .setup_txo_buffer(finalized_height, &finalized.txo_indices)
-            .await?;
+        let (mint_buffer, mint_buffer_bump) = retry_bridge_network(
+            self.network_retry,
+            "Solana pending-mint buffer upload",
+            || {
+                self.bridge_client
+                    .setup_pending_mints_buffer(finalized_height, &pending_mints)
+            },
+        )
+        .await?;
+        let (txo_buffer, txo_buffer_bump) = retry_bridge_network(
+            self.network_retry,
+            "Solana TXO buffer upload",
+            || {
+                self.bridge_client
+                    .setup_txo_buffer(finalized_height, &finalized.txo_indices)
+            },
+        )
+        .await?;
         Ok(UploadedBuffers {
             mint_buffer,
             mint_buffer_bump,
@@ -1257,11 +1531,19 @@ impl E2EBlockPipeline {
                     "pending mint recipient {recipient} is not a configured recipient ATA"
                 );
             }
-            if rpc.get_account(&recipient).await.is_err() {
-                anyhow::bail!(
-                    "configured recipient ATA {recipient} does not exist; create it before starting the block pipeline"
-                );
-            }
+            self.network_retry
+                .run("Solana recipient ATA lookup", || async {
+                    match rpc.get_account(&recipient).await {
+                        Ok(_) => RetryAction::Success(()),
+                        Err(error) if is_retryable_solana_client_error(&error) => {
+                            RetryAction::Retry(anyhow::Error::new(error))
+                        }
+                        Err(_) => RetryAction::Fatal(anyhow::anyhow!(
+                            "configured recipient ATA {recipient} does not exist; create it before starting the block pipeline"
+                        )),
+                    }
+                })
+                .await?;
         }
         Ok(())
     }
@@ -1276,14 +1558,18 @@ impl E2EBlockPipeline {
             .iter()
             .map(PendingMintPayload::to_bridge_mint)
             .collect();
-        let result = self
-            .bridge_client
-            .process_remaining_pending_mints_groups(
-                &pending_mints,
-                buffers.mint_buffer,
-                buffers.mint_buffer_bump,
-            )
-            .await?;
+        let result = retry_bridge_network(
+            self.network_retry,
+            "Solana pending-mint processing",
+            || {
+                self.bridge_client.process_remaining_pending_mints_groups(
+                    &pending_mints,
+                    buffers.mint_buffer,
+                    buffers.mint_buffer_bump,
+                )
+            },
+        )
+        .await?;
         if !result.fully_completed || result.total_mints_processed != pending_mints.len() {
             anyhow::bail!(
                 "mint processing completed={} and processed {} of {} pending mints",
@@ -1304,8 +1590,304 @@ impl E2EBlockPipeline {
     }
 }
 
+async fn retry_bridge_network<T, F, Fut>(
+    policy: NetworkRetryPolicy,
+    operation_name: &'static str,
+    operation: F,
+) -> Result<T, BridgeError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, BridgeError>>,
+{
+    policy
+        .run(operation_name, || async {
+            match operation().await {
+                Ok(value) => RetryAction::Success(value),
+                Err(error) if is_retryable_bridge_error(&error) => RetryAction::Retry(error),
+                Err(error) => RetryAction::Fatal(error),
+            }
+        })
+        .await
+}
+
+fn is_retryable_bridge_error(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Rpc(error) => is_retryable_solana_client_error(error),
+        BridgeError::RateLimited { .. } | BridgeError::ConnectionTimeout => true,
+        // ConfirmationTimeout means the transaction was submitted but its
+        // confirmation could not be observed. The BridgeClient interface
+        // does not expose the in-flight signature, so the pipeline cannot
+        // reconcile against on-chain state by signature. Resending blindly
+        // risks a double submission (e.g. a duplicate mint), so fail closed
+        // and surface the error to the supervisor instead of retrying.
+        BridgeError::ConfirmationTimeout { .. } => false,
+        _ => false,
+    }
+}
+
+fn is_retryable_solana_client_error(error: &solana_client::client_error::ClientError) -> bool {
+    match error.kind() {
+        ClientErrorKind::Io(error) => crate::network_retry::is_retryable_io_kind(error.kind()),
+        ClientErrorKind::Reqwest(error) => {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || has_retryable_io_source(error)
+        }
+        ClientErrorKind::Middleware(error) => has_retryable_io_source(error.as_ref()),
+        ClientErrorKind::RpcError(error) => {
+            matches!(
+                error,
+                solana_client::rpc_request::RpcError::RpcRequestError(_)
+                    | solana_client::rpc_request::RpcError::RpcResponseError {
+                        code: 429 | -32004 | -32005 | -32007 | -32009,
+                        ..
+                    }
+            )
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod network_retry_tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn solana_connection_reset_is_retryable() {
+        let error = solana_client::client_error::ClientError::from(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+
+        assert!(is_retryable_solana_client_error(&error));
+    }
+
+    #[test]
+    fn solana_invalid_data_is_not_retryable() {
+        let error = solana_client::client_error::ClientError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid response",
+        ));
+
+        assert!(!is_retryable_solana_client_error(&error));
+    }
+
+    #[test]
+    fn solana_confirmation_timeout_is_not_blindly_resent() {
+        // The BridgeClient interface does not expose the in-flight signature
+        // for a ConfirmationTimeout, so the pipeline cannot reconcile by
+        // signature. Treat it as fatal (no blind resend) to avoid duplicate
+        // submissions such as a duplicate mint.
+        assert!(!is_retryable_bridge_error(&BridgeError::ConfirmationTimeout {
+            timeout_ms: 60_000,
+        }));
+        assert!(is_retryable_bridge_error(&BridgeError::ConnectionTimeout));
+        assert!(is_retryable_bridge_error(&BridgeError::RateLimited { retry_after_ms: 100 }));
+    }
+}
+pub async fn recover_checkpoint_from_proof_archive(
+    config: &BlockPipelineConfig,
+    proof_archive_dir: &Path,
+) -> anyhow::Result<u32> {
+    validate_config(config)?;
+    let redis = build_redis_pool(config)?;
+    tokio::time::timeout(REDIS_INIT_DEADLINE, redis.init())
+        .await
+        .map_err(|_| anyhow::anyhow!("redis init exceeded {REDIS_INIT_DEADLINE:?}"))??;
+    let checkpoint_key = format!(
+        "{CHECKPOINT_PREFIX}-{}-{}",
+        config.network.as_str(),
+        config.redis_seed
+    );
+    let checkpoint_json = tokio::time::timeout(
+        REDIS_CHECKPOINT_DEADLINE,
+        redis.get::<Option<String>, _>(&checkpoint_key),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("redis checkpoint load exceeded {REDIS_CHECKPOINT_DEADLINE:?}"))??
+    .ok_or_else(|| anyhow::anyhow!("current Redis checkpoint is missing"))?;
+    let checkpoint: PipelineCheckpoint = serde_json::from_str(&checkpoint_json)?;
+    validate_checkpoint(&checkpoint)?;
+    let height = checkpoint
+        .height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
+
+    let old_state_bytes = tokio::fs::read(proof_archive_dir.join("old_state.bin")).await?;
+    let old_header = tokio::fs::read(proof_archive_dir.join("old_header.bin")).await?;
+    if old_state_bytes != hex::decode(&checkpoint.state_hex)? {
+        anyhow::bail!("proof archive old state does not match the current Redis checkpoint");
+    }
+    if old_header != hex::decode(&checkpoint.header_hex)? {
+        anyhow::bail!("proof archive old header does not match the current Redis checkpoint");
+    }
+    let witness_bytes = tokio::fs::read(proof_archive_dir.join("witness.bin")).await?;
+    let witness = PsyDogeBridgeIncomingBlockWitness::read_from_buffer(&witness_bytes)?;
+    let custody_script_config = CustodyScriptConfig::new(config.custody_script_config);
+    let evaluation = match config.network {
+        DogeNetworkProfile::Regtest => evaluate_claim_witness::<LocalRegtestManagerCustody>(
+            height,
+            &witness.claim_witness,
+            witness.block_header.header.merkle_root,
+            &custody_script_config,
+            deposit_flat_fee(&config.config_params),
+            deposit_fee_numerator(&config.config_params),
+            deposit_fee_denominator(&config.config_params),
+        )?,
+        DogeNetworkProfile::Testnet => evaluate_claim_witness::<OfficialTestnetManagerCustody>(
+            height,
+            &witness.claim_witness,
+            witness.block_header.header.merkle_root,
+            &custody_script_config,
+            deposit_flat_fee(&config.config_params),
+            deposit_fee_numerator(&config.config_params),
+            deposit_fee_denominator(&config.config_params),
+        )?,
+    };
+    let mut new_state = BridgeState::try_from_slice(&old_state_bytes)?;
+    match config.network {
+        DogeNetworkProfile::Regtest => new_state.append_block::<DogeRegTestConfig>(
+            height,
+            &witness.block_header,
+            evaluation.transition.new_claimed_txo_tree_root,
+            evaluation.transition.new_auto_claimed_deposits_tree_root,
+            evaluation.transition.end_auto_claimed_deposits_index,
+            evaluation.transition.fees_collected,
+            None,
+        )?,
+        DogeNetworkProfile::Testnet => new_state.append_block::<DogeTestNetConfig>(
+            height,
+            &witness.block_header,
+            evaluation.transition.new_claimed_txo_tree_root,
+            evaluation.transition.new_auto_claimed_deposits_tree_root,
+            evaluation.transition.end_auto_claimed_deposits_index,
+            evaluation.transition.fees_collected,
+            None,
+        )?,
+    }
+    let finalized_height = height
+        .checked_sub(config.required_confirmations)
+        .ok_or_else(|| anyhow::anyhow!("finalized height underflow"))?;
+    let finalized_buffers = checkpoint
+        .pending_finalization
+        .get(&finalized_height)
+        .cloned()
+        .unwrap_or(BlockBufferCommitment::empty()?);
+    let old_header = decode_fixed::<HEADER_SIZE>(&checkpoint.header_hex, "checkpoint header")?;
+    let new_header = build_new_solana_header(
+        &old_header,
+        &new_state,
+        config.required_confirmations,
+        finalized_buffers.pending_mints_hash()?,
+        finalized_buffers.txo_output_list_hash()?,
+    )?;
+    let archived_header = tokio::fs::read(proof_archive_dir.join("new_header.bin")).await?;
+    if archived_header != new_header {
+        anyhow::bail!("reconstructed header does not match the proven archived header");
+    }
+
+    let mut claim_history = checkpoint.claim_history.clone();
+    claim_history.extend_from_slice(&evaluation.deposit_leaf_hashes);
+    let claim_frontier = if let Some(last_leaf) = claim_history.last() {
+        let last_index = claim_history.len() - 1;
+        MerkleFrontier::new(
+            last_index as u32,
+            *last_leaf,
+            &sparse_sha256_merkle_siblings(
+                &claim_history,
+                last_index,
+                AUTO_CLAIM_DEPOSITS_TREE_HEIGHT,
+                0,
+            )?,
+        )
+    } else {
+        checkpoint.claim_frontier.clone()
+    };
+    let (txo_block_frontier, txo_block_history) = if checkpoint.txo_block_history.is_empty() {
+        let txo_siblings = sequential_next_leaf_siblings(
+            &checkpoint.txo_block_frontier,
+            height,
+            TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+            TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+            "TXO block frontier",
+        )?;
+        (
+            MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+            Vec::new(),
+        )
+    } else {
+        let mut history = checkpoint.txo_block_history.clone();
+        if history.len() != height as usize {
+            anyhow::bail!(
+                "TXO block history length {} does not match next height {height}",
+                history.len()
+            );
+        }
+        history.push(evaluation.block_txo_root);
+        let txo_siblings = sparse_sha256_merkle_siblings(
+            &history,
+            height as usize,
+            TXO_TREE_INDEX_BITS_BLOCK_NUM_LENGTH,
+            TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT,
+        )?;
+        (
+            MerkleFrontier::new(height, evaluation.block_txo_root, &txo_siblings),
+            history,
+        )
+    };
+    let mut pending_finalization = checkpoint.pending_finalization.clone();
+    pending_finalization.insert(height, BlockBufferCommitment::from_evaluation(&evaluation));
+    pending_finalization.remove(&finalized_height);
+    let recovered = PipelineCheckpoint {
+        height,
+        state_hex: hex::encode(borsh::to_vec(&new_state)?),
+        header_hex: hex::encode(new_header),
+        claim_frontier,
+        txo_block_frontier,
+        claim_history,
+        txo_block_history,
+        pending_finalization,
+    };
+    validate_checkpoint(&recovered)?;
+
+    let operator = read_pipeline_keypair(&config.operator_keypair, "operator")?;
+    let payer = read_pipeline_keypair(&config.payer_keypair, "payer")?;
+    let (bridge_state_pda, _) =
+        Pubkey::find_program_address(&[b"bridge_state"], &config.bridge_program);
+    let bridge_client = BridgeClient::with_config(
+        BridgeClientConfigBuilder::new()
+            .rpc_url(config.solana_rpc_url.clone())
+            .bridge_state_pda(bridge_state_pda)
+            .operator(operator)
+            .payer(payer)
+            .doge_mint(config.doge_mint)
+            .program_id(config.bridge_program)
+            .pending_mint_program_id(config.pending_mint_program)
+            .txo_buffer_program_id(config.txo_buffer_program)
+            .wormhole_core_program_id(config.bridge_program)
+            .wormhole_shim_program_id(config.bridge_program)
+            .build()?,
+    )?;
+    let chain_state = bridge_client.get_current_bridge_state().await?;
+    assert_checkpoint_matches_chain(&recovered, &chain_state.bridge_header)?;
+    redis
+        .set::<(), _, _>(
+            &checkpoint_key,
+            serde_json::to_string(&recovered)?,
+            None,
+            None,
+            false,
+        )
+        .await?;
+    Ok(height)
+}
+
+
 async fn initialize_checkpoint(
-    config: &E2EBlockPipelineConfig,
+    config: &BlockPipelineConfig,
     block_rpc: &DogeLinkElectrsAsyncClient,
 ) -> anyhow::Result<PipelineCheckpoint> {
     let electrs_tip = block_rpc.get_block_height().await?;
@@ -1968,29 +2550,14 @@ fn build_new_solana_header(
 
 
 
-fn parse_prover_field<'a>(stdout: &'a [u8], field: &str) -> anyhow::Result<&'a str> {
-    let stdout = std::str::from_utf8(stdout)?;
-    stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(&format!("{field}:")))
-        .map(str::trim)
-        .ok_or_else(|| anyhow::anyhow!("gen-proof stdout did not contain {field}"))
-}
 
 async fn prepare_prover_request(
-    config: &E2EBlockPipelineConfig,
+    config: &BlockPipelineConfig,
     old_state: &[u8],
     witness: &[u8],
     old_header: &[u8; HEADER_SIZE],
     new_header: &[u8; HEADER_SIZE],
 ) -> anyhow::Result<()> {
-    for path in [PROOF_PATH, PUBLIC_VALUES_PATH] {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
     if std::env::var_os("DOGE_SAVE_PROVER_ARGS").is_some() {
         let args = serde_json::json!({
             "network": config.network.as_str(),
@@ -2015,7 +2582,7 @@ async fn prepare_prover_request(
 }
 
 async fn validate_prover_identity(
-    config: &E2EBlockPipelineConfig,
+    config: &BlockPipelineConfig,
     identity: &ProverIdentityResponse,
 ) -> anyhow::Result<[u8; 32]> {
     if identity.kind != "identity" {
@@ -2031,7 +2598,14 @@ async fn validate_prover_identity(
             identity.network
         );
     }
-    validate_prover_elf(config, &identity.block_elf_path, &identity.block_elf_sha256).await?;
+    if identity.guest_id != config.network.guest_id() {
+        anyhow::bail!(
+            "SP1 prover guest id mismatch: expected {}, got {}",
+            config.network.guest_id(),
+            identity.guest_id
+        );
+    }
+    validate_prover_elf_sha256(config, &identity.block_elf_sha256).await?;
     let vk_hash = decode_prover_hash(&identity.vkey_hash, "SP1 program VK hash")?;
     if vk_hash != config.expected_vk_hash {
         anyhow::bail!(
@@ -2043,27 +2617,21 @@ async fn validate_prover_identity(
     Ok(vk_hash)
 }
 
-async fn validate_prover_elf(
-    config: &E2EBlockPipelineConfig,
-    prover_elf_path: &str,
+/// Validate the daemon's embedded ELF by its SHA-256 digest against the
+/// configured block-transition ELF. The daemon identity is path-independent,
+/// so the daemon's local ELF path is intentionally not compared.
+async fn validate_prover_elf_sha256(
+    config: &BlockPipelineConfig,
     prover_elf_sha256: &str,
 ) -> anyhow::Result<()> {
-    let prover_elf_path = PathBuf::from(prover_elf_path);
-    let configured_elf_path = std::fs::canonicalize(&config.block_elf_path)?;
-    let embedded_elf_path = std::fs::canonicalize(&prover_elf_path).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to resolve gen-proof embedded ELF path {}: {error}",
-            prover_elf_path.display()
-        )
-    })?;
-    if embedded_elf_path != configured_elf_path {
-        anyhow::bail!(
-            "SP1 ELF path mismatch: gen-proof embeds {}, pipeline configured {}",
-            embedded_elf_path.display(),
-            configured_elf_path.display()
-        );
-    }
-    let configured_elf = tokio::fs::read(&configured_elf_path).await?;
+    let configured_elf = tokio::fs::read(&config.block_elf_path)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read configured block-transition ELF {}: {error}",
+                config.block_elf_path.display()
+            )
+        })?;
     let configured_elf_sha256 = sha256_hex(&configured_elf);
     if prover_elf_sha256 != configured_elf_sha256 {
         anyhow::bail!(
@@ -2074,7 +2642,7 @@ async fn validate_prover_elf(
 }
 
 fn validate_proof_response(
-    config: &E2EBlockPipelineConfig,
+    config: &BlockPipelineConfig,
     identity_vk_hash: [u8; 32],
     response: &ProverProofResponse,
 ) -> anyhow::Result<()> {
@@ -2085,16 +2653,14 @@ fn validate_proof_response(
             config.network.as_str()
         );
     }
-    let block_elf_path = response
-        .block_elf_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("gen-proof response omitted block_elf_path"))?;
-    let response_elf_path = std::fs::canonicalize(block_elf_path)?;
-    let configured_elf_path = std::fs::canonicalize(&config.block_elf_path)?;
-    if response_elf_path != configured_elf_path {
-        anyhow::bail!("gen-proof response block_elf_path changed after identity validation");
+    if response.guest_id.as_deref() != Some(config.network.guest_id()) {
+        anyhow::bail!(
+            "gen-proof response guest id {:?} did not match {}",
+            response.guest_id,
+            config.network.guest_id()
+        );
     }
-    let configured_elf = std::fs::read(&configured_elf_path)?;
+    let configured_elf = std::fs::read(&config.block_elf_path)?;
     let configured_elf_sha256 = sha256_hex(&configured_elf);
     if response.block_elf_sha256.as_deref() != Some(configured_elf_sha256.as_str()) {
         anyhow::bail!("gen-proof response block_elf_sha256 changed after identity validation");
@@ -2109,12 +2675,6 @@ fn validate_proof_response(
     if response_vk_hash != identity_vk_hash || response_vk_hash != config.expected_vk_hash {
         anyhow::bail!("gen-proof response VK hash changed after identity validation");
     }
-    if response.proof_path.as_deref() != Some(PROOF_PATH) {
-        anyhow::bail!("gen-proof response proof_path was not {PROOF_PATH}");
-    }
-    if response.public_values_path.as_deref() != Some(PUBLIC_VALUES_PATH) {
-        anyhow::bail!("gen-proof response public_values_path was not {PUBLIC_VALUES_PATH}");
-    }
     Ok(())
 }
 
@@ -2127,8 +2687,9 @@ fn decode_prover_hash(value: &str, name: &str) -> anyhow::Result<[u8; 32]> {
     decode_fixed::<32>(value.strip_prefix("0x").unwrap_or(value), name)
 }
 
+
 async fn persist_evidence(
-    config: &E2EBlockPipelineConfig,
+    config: &BlockPipelineConfig,
     height: u32,
     finalized_source_height: u32,
     idempotency_key: &str,
@@ -2399,9 +2960,9 @@ fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
+fn validate_config(config: &BlockPipelineConfig) -> anyhow::Result<()> {
     if cfg!(debug_assertions) {
-        anyhow::bail!("e2e block pipeline must be built in release mode");
+        anyhow::bail!("block pipeline must be built in release mode");
     }
     if !config.gen_proof_path.is_file() {
         anyhow::bail!(
@@ -2477,6 +3038,292 @@ fn validate_config(config: &E2EBlockPipelineConfig) -> anyhow::Result<()> {
         anyhow::bail!("derived buffer PDA must be non-zero");
     }
     Ok(())
+}
+
+async fn reconcile_checkpoint_journal(
+    redis: &fred::prelude::Pool,
+    checkpoint_key: &str,
+    checkpoint: PipelineCheckpoint,
+    chain_header: &PsyBridgeHeader,
+    bridge_client: &BridgeClient,
+    network_retry: NetworkRetryPolicy,
+) -> anyhow::Result<PipelineCheckpoint> {
+    let journal_key = checkpoint_journal_key(checkpoint_key);
+
+    // First compare the committed checkpoint against the on-chain header. When
+    // they match, the last block_update was NOT submitted, so any lingering
+    // journal records only partial pre-submission work. Delete the raw journal
+    // key without deserializing it: a corrupt or bad-JSON stale journal must
+    // not block this safe discard, and poll_once reprocesses the height
+    // deterministically.
+    if assert_checkpoint_matches_chain(&checkpoint, chain_header).is_ok() {
+        let journal_present = redis
+            .get::<Option<String>, _>(&journal_key)
+            .await?
+            .is_some();
+        if matches!(
+            stale_journal_action(true, journal_present),
+            StaleJournalAction::DiscardRaw
+        ) {
+            redis.del::<(), _>(&journal_key).await?;
+            eprintln!(
+                "discarded stale checkpoint journal for height {} (on-chain header not yet advanced); pipeline will reprocess",
+                checkpoint.height + 1
+            );
+        }
+        return Ok(checkpoint);
+    }
+
+    // The on-chain header advanced past the committed checkpoint, so the
+    // block_update was submitted. Recovery requires a usable journal; a
+    // missing or corrupt journal fails closed.
+    let journal_json = redis
+        .get::<Option<String>, _>(&journal_key)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "on-chain bridge header advanced past Redis checkpoint height {} without a pending journal; cannot reconcile, fail closed",
+                checkpoint.height
+            )
+        })?;
+    let journal: CheckpointJournal = serde_json::from_str(&journal_json)?;
+    validate_checkpoint(&journal.checkpoint)?;
+
+    match plan_journal_recovery(&checkpoint, chain_header, Some(&journal)) {
+        JournalRecoveryPlan::UpToDate | JournalRecoveryPlan::DiscardStaleJournal => {
+            // Handled above by the raw-key discard path; unreachable here.
+            Ok(checkpoint)
+        }
+        JournalRecoveryPlan::PromoteCheckpoint { checkpoint } => {
+            validate_checkpoint(&checkpoint)?;
+            redis
+                .set::<(), _, _>(
+                    checkpoint_key,
+                    serde_json::to_string(&checkpoint)?,
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
+            redis.del::<(), _>(&journal_key).await?;
+            eprintln!(
+                "recovered committed checkpoint {} from pending journal (mint already completed)",
+                checkpoint.height
+            );
+            Ok(checkpoint)
+        }
+        JournalRecoveryPlan::CompleteMint {
+            checkpoint,
+            finalized_commitment,
+            uploaded_buffers,
+        } => {
+            validate_checkpoint(&checkpoint)?;
+            // Idempotently complete mint processing. The on-chain pending-mint
+            // tracker skips groups that were already claimed, so re-running is
+            // safe; a ConfirmationTimeout fails closed (no blind resend).
+            if !finalized_commitment.pending_mints.is_empty() {
+                let pending_mints: Vec<PendingMint> = finalized_commitment
+                    .pending_mints
+                    .iter()
+                    .map(PendingMintPayload::to_bridge_mint)
+                    .collect();
+                let result = retry_bridge_network(
+                    network_retry,
+                    "Solana pending-mint recovery",
+                    || {
+                        bridge_client.process_remaining_pending_mints_groups(
+                            &pending_mints,
+                            uploaded_buffers.mint_buffer,
+                            uploaded_buffers.mint_buffer_bump,
+                        )
+                    },
+                )
+                .await?;
+                // Verify completion by the BridgeClient's fully_completed
+                // contract only. Do NOT compare this run's newly-processed
+                // count against the original pending-mint total: groups that
+                // were already claimed in a prior partial run are skipped, so
+                // total_mints_processed can be 0 even when minting is fully
+                // complete. A cumulative-semantics fix for the count lives in
+                // the BridgeClient (separate task); here we rely on
+                // fully_completed plus the on-chain tracker's idempotency.
+                mint_recovery_succeeded(&result)?;
+            }
+            redis
+                .set::<(), _, _>(
+                    checkpoint_key,
+                    serde_json::to_string(&checkpoint)?,
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
+            redis.del::<(), _>(&journal_key).await?;
+            eprintln!(
+                "recovered committed checkpoint {} from pending journal after completing mint recovery",
+                checkpoint.height
+            );
+            Ok(checkpoint)
+        }
+        JournalRecoveryPlan::FailClosed(reason) => {
+            anyhow::bail!("{reason}")
+        }
+    }
+}
+
+/// What to do about a lingering journal key when the committed checkpoint
+/// matches the on-chain header (block_update was NOT submitted). This decision
+/// depends only on raw key presence, never on the journal's JSON contents, so
+/// a corrupt or bad-JSON stale journal is safely discarded.
+enum StaleJournalAction {
+    UpToDate,
+    DiscardRaw,
+}
+
+fn stale_journal_action(committed_matches_chain: bool, journal_present: bool) -> StaleJournalAction {
+    if committed_matches_chain {
+        if journal_present {
+            StaleJournalAction::DiscardRaw
+        } else {
+            StaleJournalAction::UpToDate
+        }
+    } else {
+        // The advanced case is handled by plan_journal_recovery; this helper is
+        // only consulted on the committed-matches path.
+        StaleJournalAction::UpToDate
+    }
+}
+
+/// Verify that an idempotent mint recovery run fully completed. Relies on the
+/// BridgeClient's `fully_completed` contract rather than comparing this run's
+/// processed count to the original pending-mint total (already-claimed groups
+/// are skipped, so the count can be 0 on a successful no-op recovery).
+fn mint_recovery_succeeded(result: &ProcessMintsResult) -> anyhow::Result<()> {
+    if !result.fully_completed {
+        anyhow::bail!(
+            "mint recovery did not fully complete pending mints (BridgeClient reported fully_completed=false)"
+        );
+    }
+    Ok(())
+}
+
+/// Pure decision logic for journal recovery, separated from the Redis and
+/// Solana execution so the recovery contract can be tested without live
+/// services.
+#[derive(Debug)]
+enum JournalRecoveryPlan {
+    /// The committed checkpoint matches the on-chain header; nothing to do.
+    UpToDate,
+    /// The committed checkpoint matches the on-chain header but a stale
+    /// journal lingers from a crash before `block_update` was submitted.
+    /// Discard it and reprocess the height deterministically.
+    DiscardStaleJournal,
+    /// The on-chain header advanced and minting was already completed; just
+    /// promote the journal checkpoint.
+    PromoteCheckpoint { checkpoint: PipelineCheckpoint },
+    /// The on-chain header advanced and minting is incomplete; idempotently
+    /// complete mint processing, then promote the journal checkpoint.
+    CompleteMint {
+        checkpoint: PipelineCheckpoint,
+        finalized_commitment: BlockBufferCommitment,
+        uploaded_buffers: UploadedBuffers,
+    },
+    /// Recovery is impossible without losing safety; the supervisor must
+    /// fail closed.
+    FailClosed(String),
+}
+
+fn plan_journal_recovery(
+    checkpoint: &PipelineCheckpoint,
+    chain_header: &PsyBridgeHeader,
+    journal: Option<&CheckpointJournal>,
+) -> JournalRecoveryPlan {
+    if assert_checkpoint_matches_chain(checkpoint, chain_header).is_ok() {
+        // The last block_update was NOT submitted (chain still at the
+        // committed checkpoint). A lingering journal records partial
+        // pre-submission work and must be discarded so poll_once reprocesses
+        // the height deterministically.
+        return if journal.is_some() {
+            JournalRecoveryPlan::DiscardStaleJournal
+        } else {
+            JournalRecoveryPlan::UpToDate
+        };
+    }
+
+    // The on-chain header advanced past the committed checkpoint, so the
+    // block_update was submitted. Recovery requires the journal.
+    let Some(journal) = journal else {
+        return JournalRecoveryPlan::FailClosed(format!(
+            "on-chain bridge header advanced past Redis checkpoint height {} without a pending journal; cannot reconcile, fail closed",
+            checkpoint.height
+        ));
+    };
+    if journal.checkpoint.height != checkpoint.height.saturating_add(1) {
+        return JournalRecoveryPlan::FailClosed(format!(
+            "checkpoint journal height {} is not exactly one above committed checkpoint height {}",
+            journal.checkpoint.height,
+            checkpoint.height
+        ));
+    }
+    if assert_checkpoint_matches_chain(&journal.checkpoint, chain_header).is_err() {
+        return JournalRecoveryPlan::FailClosed(format!(
+            "journal checkpoint height {} does not match the advanced on-chain bridge header",
+            journal.checkpoint.height
+        ));
+    }
+
+    if journal.mint_progress.is_some() {
+        // Minting already completed; promote the journal checkpoint.
+        return JournalRecoveryPlan::PromoteCheckpoint {
+            checkpoint: journal.checkpoint.clone(),
+        };
+    }
+
+    // block_update was submitted but minting is incomplete (the
+    // block_update-after / mint-before crash window). Idempotently complete
+    // the mints, which requires the finalized commitment and uploaded
+    // buffers; without them, fail closed.
+    let Some(finalized_commitment) = journal.finalized_commitment.clone() else {
+        return JournalRecoveryPlan::FailClosed(format!(
+            "on-chain header advanced to height {} but the journal lacks the finalized commitment; cannot idempotently complete mint, fail closed",
+            journal.checkpoint.height
+        ));
+    };
+    let Some(uploaded_buffers) = journal.uploaded_buffers.clone() else {
+        return JournalRecoveryPlan::FailClosed(format!(
+            "on-chain header advanced to height {} but the journal lacks the uploaded buffer addresses; cannot complete mint, fail closed",
+            journal.checkpoint.height
+        ));
+    };
+    JournalRecoveryPlan::CompleteMint {
+        checkpoint: journal.checkpoint.clone(),
+        finalized_commitment,
+        uploaded_buffers,
+    }
+}
+
+/// Build a Redis connection pool with explicit command/unresponsive timeouts
+/// and exponential reconnection. The Redis URL and any Redis values are never
+/// logged by this helper; only operational errors surface.
+fn build_redis_pool(config: &BlockPipelineConfig) -> anyhow::Result<fred::prelude::Pool> {
+    let redis_config = Config::from_url(&config.redis_url)?;
+    let pool = Builder::from_config(redis_config)
+        .with_connection_config(|connection| {
+            connection.connection_timeout = REDIS_CONNECTION_TIMEOUT;
+            connection.internal_command_timeout = REDIS_CONNECTION_TIMEOUT;
+            connection.unresponsive.max_timeout = Some(REDIS_UNRESPONSIVE_TIMEOUT);
+            connection.unresponsive.interval = Duration::from_secs(2);
+        })
+        .with_performance_config(|performance| {
+            performance.default_command_timeout = REDIS_COMMAND_TIMEOUT;
+        })
+        .set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2))
+        .build_pool(2)?;
+    Ok(pool)
+}
+
+fn checkpoint_journal_key(checkpoint_key: &str) -> String {
+    format!("{checkpoint_key}-{CHECKPOINT_JOURNAL_SUFFIX}")
 }
 
 fn ensure_release_path(path: &Path, name: &str) -> anyhow::Result<()> {
@@ -2725,6 +3572,56 @@ mod tests {
         daemon.terminate().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_alive_but_silent_times_out() {
+        // A daemon that stays alive but never emits a protocol line must not
+        // block the pipeline. The deadline-bounded read returns a timeout
+        // error promptly instead of hanging until the child exits.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn silent child");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr_task = tokio::spawn(async { Ok(()) });
+        let stderr = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut daemon = ProverDaemon {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_task: Some(stderr_task),
+            stderr,
+            vk_hash: [0; 32],
+        };
+
+        let deadline = Duration::from_millis(500);
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            daemon.read_response_line_within(deadline).await
+        })
+        .await
+        .expect("the deadline-bounded read must not hang past its own budget");
+        let error = result.expect_err("a silent daemon must time out");
+        assert!(
+            error.to_string().contains("did not respond"),
+            "{}",
+            error
+        );
+        daemon.terminate().await;
+    }
+
+    #[test]
+    fn checkpoint_journal_key_is_namespaced() {
+        assert_eq!(
+            checkpoint_journal_key("PDOGE-E2E-BLOCK-CHECKPOINT-V3-testnet-1337"),
+            "PDOGE-E2E-BLOCK-CHECKPOINT-V3-testnet-1337-pending"
+        );
+    }
+
 
     const CUSTODY_SCRIPT_CONFIG: CustodyScriptConfig = CustodyScriptConfig::new([7u8; 32]);
     const RECIPIENT_ATA: [u8; 32] = [9u8; 32];
@@ -2739,6 +3636,204 @@ mod tests {
         stale.header_hex = hex::encode([1u8; HEADER_SIZE]);
         let error = assert_checkpoint_matches_chain(&stale, &chain_header).unwrap_err();
         assert!(error.to_string().contains("stale off-chain state"));
+    }
+
+    fn test_journal(
+        checkpoint: PipelineCheckpoint,
+        finalized: bool,
+        uploaded: bool,
+        signature: bool,
+        mint_done: bool,
+    ) -> CheckpointJournal {
+        CheckpointJournal {
+            checkpoint,
+            uploaded_buffers: if uploaded {
+                Some(UploadedBuffers {
+                    mint_buffer: Pubkey::default(),
+                    mint_buffer_bump: 0,
+                    txo_buffer: Pubkey::default(),
+                    txo_buffer_bump: 0,
+                })
+            } else {
+                None
+            },
+            finalized_commitment: if finalized {
+                Some(BlockBufferCommitment::empty().unwrap())
+            } else {
+                None
+            },
+            submission_signature: if signature {
+                Some("sig".to_string())
+            } else {
+                None
+            },
+            mint_progress: if mint_done {
+                Some(MintProgressRecord {
+                    signatures: Vec::new(),
+                    groups_processed: 0,
+                    total_mints_processed: 0,
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_up_to_date_when_committed_matches_chain() {
+        let committed = empty_checkpoint(42);
+        let chain_header = PsyBridgeHeader::default();
+        assert!(matches!(
+            plan_journal_recovery(&committed, &chain_header, None),
+            JournalRecoveryPlan::UpToDate
+        ));
+    }
+
+    #[test]
+    fn journal_recovery_plan_discards_stale_journal_when_chain_not_advanced() {
+        // The committed checkpoint matches the on-chain header, so
+        // block_update was NOT submitted. A lingering journal records
+        // partial pre-submission work and must be discarded.
+        let committed = empty_checkpoint(42);
+        let chain_header = PsyBridgeHeader::default();
+        let journal = test_journal(empty_checkpoint(43), true, true, false, false);
+        assert!(matches!(
+            plan_journal_recovery(&committed, &chain_header, Some(&journal)),
+            JournalRecoveryPlan::DiscardStaleJournal
+        ));
+    }
+
+    #[test]
+    fn stale_journal_action_discards_raw_key_without_inspecting_json() {
+        // When the committed checkpoint matches the on-chain header, a
+        // lingering journal key is discarded by raw presence alone. The
+        // decision never inspects the journal JSON, so a corrupt or bad-JSON
+        // stale journal (which cannot be deserialized into a CheckpointJournal)
+        // is still safely discarded instead of blocking recovery.
+        assert!(matches!(
+            stale_journal_action(true, true),
+            StaleJournalAction::DiscardRaw
+        ));
+        assert!(matches!(
+            stale_journal_action(true, false),
+            StaleJournalAction::UpToDate
+        ));
+        // The advanced case is handled elsewhere; this helper is only consulted
+        // on the committed-matches path and reports UpToDate.
+        assert!(matches!(
+            stale_journal_action(false, true),
+            StaleJournalAction::UpToDate
+        ));
+    }
+
+    #[test]
+    fn mint_recovery_succeeds_when_already_complete_even_if_fourth_write_missing() {
+        // The fourth journal write (mint_progress) did not happen, so recovery
+        // re-runs mint processing. If every group was already claimed on-chain,
+        // the BridgeClient skips them and reports total_mints_processed == 0
+        // this run but fully_completed == true. Recovery must accept this and
+        // NOT compare this run's processed count to the original total.
+        let already_complete = ProcessMintsResult::new(0, 0, Vec::new(), true);
+        assert!(mint_recovery_succeeded(&already_complete).is_ok());
+
+        // A genuinely incomplete recovery (fully_completed == false) must fail.
+        let incomplete = ProcessMintsResult::new(2, 10, Vec::new(), false);
+        assert!(mint_recovery_succeeded(&incomplete).is_err());
+    }
+
+    #[test]
+    fn journal_recovery_plan_completes_mint_after_block_update_before_mint_crash() {
+        // block_update was submitted (on-chain header advanced to H+1) but
+        // the pipeline crashed before processing mints. Recovery must
+        // idempotently complete minting using the persisted finalized
+        // commitment and uploaded buffers, then promote the journal
+        // checkpoint.
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]); // stale vs advanced chain
+        let chain_header = PsyBridgeHeader::default(); // matches journal checkpoint (zeros)
+        let journal = test_journal(empty_checkpoint(43), true, true, true, false);
+        match plan_journal_recovery(&committed, &chain_header, Some(&journal)) {
+            JournalRecoveryPlan::CompleteMint {
+                checkpoint,
+                finalized_commitment,
+                uploaded_buffers,
+            } => {
+                assert_eq!(checkpoint.height, 43);
+                assert!(finalized_commitment.pending_mints.is_empty());
+                assert_eq!(uploaded_buffers.mint_buffer, Pubkey::default());
+            }
+            other => panic!("expected CompleteMint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_promotes_checkpoint_when_mint_already_done() {
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let chain_header = PsyBridgeHeader::default();
+        let journal = test_journal(empty_checkpoint(43), true, true, true, true);
+        match plan_journal_recovery(&committed, &chain_header, Some(&journal)) {
+            JournalRecoveryPlan::PromoteCheckpoint { checkpoint } => {
+                assert_eq!(checkpoint.height, 43);
+            }
+            other => panic!("expected PromoteCheckpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_fails_closed_without_journal() {
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let chain_header = PsyBridgeHeader::default();
+        match plan_journal_recovery(&committed, &chain_header, None) {
+            JournalRecoveryPlan::FailClosed(reason) => {
+                assert!(reason.contains("without a pending journal"), "{reason}");
+            }
+            other => panic!("expected FailClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_fails_closed_without_finalized_commitment() {
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let chain_header = PsyBridgeHeader::default();
+        let journal = test_journal(empty_checkpoint(43), false, true, true, false);
+        match plan_journal_recovery(&committed, &chain_header, Some(&journal)) {
+            JournalRecoveryPlan::FailClosed(reason) => {
+                assert!(reason.contains("finalized commitment"), "{reason}");
+            }
+            other => panic!("expected FailClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_fails_closed_without_uploaded_buffers() {
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let chain_header = PsyBridgeHeader::default();
+        let journal = test_journal(empty_checkpoint(43), true, false, true, false);
+        match plan_journal_recovery(&committed, &chain_header, Some(&journal)) {
+            JournalRecoveryPlan::FailClosed(reason) => {
+                assert!(reason.contains("uploaded buffer addresses"), "{reason}");
+            }
+            other => panic!("expected FailClosed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journal_recovery_plan_fails_closed_on_height_mismatch() {
+        let mut committed = empty_checkpoint(42);
+        committed.header_hex = hex::encode([1u8; HEADER_SIZE]);
+        let chain_header = PsyBridgeHeader::default();
+        // Journal checkpoint is two ahead, not exactly one.
+        let journal = test_journal(empty_checkpoint(44), true, true, true, false);
+        match plan_journal_recovery(&committed, &chain_header, Some(&journal)) {
+            JournalRecoveryPlan::FailClosed(reason) => {
+                assert!(reason.contains("not exactly one above"), "{reason}");
+            }
+            other => panic!("expected FailClosed, got {other:?}"),
+        }
     }
 
     fn empty_checkpoint(height: u32) -> PipelineCheckpoint {

@@ -6,95 +6,88 @@ use doge_bridge_client::constants::{
     DOGE_BRIDGE_PROGRAM_ID, PENDING_MINT_BUFFER_BUILDER_PROGRAM_ID,
     TXO_BUFFER_BUILDER_PROGRAM_ID,
 };
-use solana_sdk::pubkey::Pubkey;
-use qed_dsol_ibc_node_common::e2e_block_pipeline::{
-    DogeNetworkProfile, E2EBlockPipeline, E2EBlockPipelineConfig,
+use qed_dsol_ibc_node_common::block_pipeline::{
+    recover_checkpoint_from_proof_archive, DogeNetworkProfile, BlockPipeline,
+    BlockPipelineConfig,
 };
+use solana_sdk::pubkey::Pubkey;
+
+#[derive(Debug, Clone, clap::Subcommand)]
+enum Command {
+    Run,
+    Recover {
+        #[arg(long)]
+        proof_archive_dir: PathBuf,
+    },
+}
 
 #[derive(Debug, Parser)]
-#[command(about = "Poll finalized Dogecoin blocks, prove the current SP1 transition, and submit block_update")]
+#[command(about = "Poll finalized Dogecoin blocks, prove SP1 transitions, and submit Solana block updates")]
 struct Args {
-    /// Dogecoin consensus/profile selection. Regtest remains the default.
-    #[arg(long, env = "DOGE_NETWORK", value_enum, default_value_t)]
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[arg(long, env = "DOGE_NETWORK", value_enum)]
     network: DogeNetworkProfile,
 
-    /// Electrs HTTP endpoint. The default is the local electrs REST server.
     #[arg(long, env = "DOGE_ELECTRS_URL", default_value = "http://127.0.0.1:3002")]
     electrs_url: String,
 
     #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379")]
     redis_url: String,
 
-    /// Base URL of the isolated block sender (without /api/v1).
     #[arg(long, env = "DOGE_BLOCK_SENDER_URL", default_value = "http://127.0.0.1:3000")]
     sender_url: String,
 
-    /// Required Bearer token matching the sender's API_TOKEN.
     #[arg(long, env = "DOGE_BLOCK_SENDER_TOKEN")]
     sender_token: String,
 
-    #[arg(
-        long,
-        env = "SP1_GEN_PROOF_PATH",
-        default_value = "../psy-bridge-sp1/target/release/gen-proof"
-    )]
+    #[arg(long, env = "SP1_GEN_PROOF_PATH", default_value = "../psy-bridge-sp1/target/release/gen-proof")]
     gen_proof_path: PathBuf,
 
-    /// Release block-transition guest ELF embedded in gen-proof. Defaults by --network.
     #[arg(long, env = "SP1_BLOCK_ELF_PATH")]
     block_elf_path: Option<PathBuf>,
 
-    /// Expected 32-byte per-program SP1 VK hash. Defaults by --network.
     #[arg(long, env = "SP1_BLOCK_VK_HASH")]
     expected_vk_hash: Option<String>,
 
-    /// Stable root for per-height, content-addressed proof evidence and latest.json.
     #[arg(
         long,
-        env = "DOGE_BLOCK_EVIDENCE_DIR",
-        default_value = "/tmp/psy-doge-block-proof-evidence"
+        env = "DOGE_BLOCK_PROOF_ARCHIVE_DIR",
+        default_value = "/tmp/psy-doge-block-proof-archive"
     )]
-    evidence_dir: PathBuf,
+    proof_archive_dir: PathBuf,
 
     #[arg(long, env = "DOGE_POLL_INTERVAL_MS", default_value_t = 1_000)]
     poll_interval_ms: u64,
 
-    /// Isolates this pipeline's Redis checkpoint.
     #[arg(long, env = "DOGE_REDIS_SEED", default_value_t = 1_337)]
     redis_seed: u64,
 
-    /// Initial finalized height when Redis has no checkpoint. Defaults to current finalized tip.
     #[arg(long, env = "DOGE_START_HEIGHT")]
     start_height: Option<u32>,
 
-    /// Optional directory of per-height old-state hex files named <height>.hex.
     #[arg(long, env = "DOGE_OLD_STATE_DIR")]
     old_state_dir: Option<PathBuf>,
 
-    /// Optional directory of per-height witness hex files named <height>.hex.
     #[arg(long, env = "DOGE_WITNESS_DIR")]
     witness_dir: Option<PathBuf>,
 
-    /// Exact 32-byte manager custody script config preimage: the bridge-state PDA bytes.
     #[arg(long, env = "DOGE_CUSTODY_SCRIPT_CONFIG")]
     custody_script_config: String,
 
-    /// Comma-separated 32-byte recipient DOGE ATA public keys whose manager custody outputs are auto-claimed.
     #[arg(long, env = "DOGE_RECIPIENT_ATAS", value_delimiter = ',')]
     recipient_atas: Vec<String>,
 
     #[arg(long, env = "DOGE_REQUIRED_CONFIRMATIONS", default_value_t = 1)]
     required_confirmations: u32,
 
-    /// Current 48-byte repr(C) PsyBridgeConfig bytes, as hex or @hex-file.
     #[arg(long, env = "DOGE_BRIDGE_CONFIG")]
     config_params: String,
 
-    /// Optional deposit_to_solana evidence JSON to cross-check the exact manager script and txid.
     #[arg(long, env = "DOGE_DEPOSIT_EVIDENCE")]
     deposit_evidence_path: Option<PathBuf>,
 
-    /// Current 320-byte repr(C) bridge header, as hex or @hex-file.
     #[arg(long, env = "DOGE_INITIAL_HEADER")]
     initial_header: String,
 
@@ -132,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| read_fixed::<32>(value, "SP1 block VK hash"))
         .transpose()?
         .unwrap_or_else(|| args.network.default_vk_hash());
-    let config = E2EBlockPipelineConfig {
+    let config = BlockPipelineConfig {
         network: args.network,
         electrs_url: args.electrs_url,
         redis_url: args.redis_url,
@@ -141,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         gen_proof_path: args.gen_proof_path,
         block_elf_path,
         expected_vk_hash,
-        evidence_dir: args.evidence_dir,
+        evidence_dir: args.proof_archive_dir,
         poll_interval: Duration::from_millis(args.poll_interval_ms),
         redis_seed: args.redis_seed,
         start_height: args.start_height,
@@ -169,7 +162,14 @@ async fn main() -> anyhow::Result<()> {
         txo_buffer_program: args.txo_buffer_program,
     };
 
-    E2EBlockPipeline::initialize(config).await?.run().await
+    match args.command.unwrap_or(Command::Run) {
+        Command::Run => BlockPipeline::initialize(config).await?.run().await,
+        Command::Recover { proof_archive_dir } => {
+            let height = recover_checkpoint_from_proof_archive(&config, &proof_archive_dir).await?;
+            println!("recovered checkpoint height {height}");
+            Ok(())
+        }
+    }
 }
 
 fn read_fixed<const N: usize>(value: &str, name: &str) -> anyhow::Result<[u8; N]> {

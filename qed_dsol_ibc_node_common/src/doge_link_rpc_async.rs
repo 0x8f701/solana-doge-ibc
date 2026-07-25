@@ -2,40 +2,75 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::{block::{Header, SimpleHeader}, hashes::Hash, Block};
 use doge_light_client::{common_types::QHash256, core_data::{QAuxPow, QDogeBlock, QDogeBlockHeader, QMerkleBranch, QStandardBlockHeader}, doge::{coinbase_transaction::DogeAuxPowCoinbaseTransaction, transaction::BTCTransaction}};
 use futures::future;
-use qed_dsol_bridge_core::data::base_types::hash256::Hash256;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 
+use crate::network_retry::{is_retryable_reqwest, NetworkRetryPolicy, RetryAction};
 #[derive(Debug, Clone)]
 pub struct DogeLinkElectrsAsyncClient {
     electrs_url: String,
-}
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct DogeLinkBlockStatusResponse {
-    pub height: Option<u32>,
-    pub in_best_chain: bool,
-    pub next_best: Option<Hash256>,
+    client: reqwest::Client,
+    retry_policy: NetworkRetryPolicy,
 }
 
 impl DogeLinkElectrsAsyncClient {
     pub fn new(electrs_url: String) -> Self {
-        DogeLinkElectrsAsyncClient {
+        let retry_policy = NetworkRetryPolicy::default();
+        let client = reqwest::Client::builder()
+            .timeout(retry_policy.request_timeout())
+            .build()
+            .expect("Electrs HTTP client configuration must be valid");
+        Self {
             electrs_url,
+            client,
+            retry_policy,
         }
     }
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
-        let url = format!("{}/{}", self.electrs_url, path);
-        let response = reqwest::get(&url).await?.json::<T>().await?;
-        Ok(response)
+        self.get_json_with_retry(path).await
     }
     pub async fn get_bytes(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!("{}/{}", self.electrs_url, path);
-        let response = reqwest::get(&url).await?.bytes().await?.to_vec();
+        let response = self.get_response_bytes(path).await?;
         Ok(response)
     }
     pub async fn get_text(&self, path: &str) -> anyhow::Result<String> {
+        let bytes = self.get_response_bytes(path).await?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    async fn get_json_with_retry<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
+        let bytes = self.get_response_bytes(path).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn get_response_bytes(&self, path: &str) -> anyhow::Result<Vec<u8>> {
         let url = format!("{}/{}", self.electrs_url, path);
-        let response = reqwest::get(&url).await?.text().await?;
-        Ok(response)
+        self.retry_policy
+            .run("Electrs request", || async {
+                let response = match self.client.get(&url).send().await {
+                    Ok(response) => response,
+                    Err(error) if is_retryable_reqwest(&error) => {
+                        return RetryAction::Retry(anyhow::Error::new(error));
+                    }
+                    Err(error) => return RetryAction::Fatal(anyhow::Error::new(error)),
+                };
+                let status = response.status();
+                if !status.is_success() {
+                    let error = anyhow::anyhow!("Electrs request {url} returned HTTP {status}");
+                    return if crate::network_retry::is_retryable_http_status(status.as_u16()) {
+                        RetryAction::Retry(error)
+                    } else {
+                        RetryAction::Fatal(error)
+                    };
+                }
+                match response.bytes().await {
+                    Ok(bytes) => RetryAction::Success(bytes.to_vec()),
+                    Err(error) if is_retryable_reqwest(&error) => {
+                        RetryAction::Retry(anyhow::Error::new(error))
+                    }
+                    Err(error) => RetryAction::Fatal(anyhow::Error::new(error)),
+                }
+            })
+            .await
     }
 
     pub async fn get_block_height(&self) -> anyhow::Result<u32> {
@@ -46,24 +81,6 @@ impl DogeLinkElectrsAsyncClient {
             .get_json::<u32>(&format!("blocks/tip/height?fresh={cache_bust}"))
             .await?;
         Ok(height)
-    }
-    pub async fn get_block_qhash(&self, height: u32) -> anyhow::Result<QHash256> {
-        let hash_txt = self.get_text(&format!("block-height/{}", height)).await?;
-        let mut hash = [0u8; 32];
-        hex::decode_to_slice(hash_txt, &mut hash)?;
-        hash.reverse();
-        Ok(hash)
-    }
-    pub async fn get_block_hash(&self, height: u32) -> anyhow::Result<Hash256> {
-        let hash_txt = self.get_text(&format!("block-height/{}", height)).await?;
-        if hash_txt.len() != 64 {
-            anyhow::bail!("expected hash of length 64, got '{}'",hash_txt);
-        }else{
-            let mut hash = [0u8; 32];
-            hex::decode_to_slice(hash_txt, &mut hash)?;
-            hash.reverse();
-            Ok(Hash256(hash))
-        }
     }
     pub async fn get_block(&self, height: u32) -> anyhow::Result<Block> {
         let hash_txt = self.get_text(&format!("block-height/{}", height)).await?;
@@ -76,54 +93,15 @@ impl DogeLinkElectrsAsyncClient {
         Ok(btc_block)
 
     }
-    pub async fn get_block_header_by_hash(&self, hash: Hash256) -> anyhow::Result<Header> {
-        let block_header_hex = self.get_text(&format!("block/{}/header", hash.to_reversed_hex_string())).await?;
-        println!("block_header_hex: {}, hash: {}", block_header_hex, hash.to_reversed_hex_string());
-        let btc_block_header: Header = bitcoin::consensus::encode::deserialize(&hex::decode(block_header_hex)?)?;
-        Ok(btc_block_header)
-    }
-    pub async fn get_block_header(&self, height: u32) -> anyhow::Result<Header> {
-        self.get_block_header_by_hash(self.get_block_hash(height).await?).await
-    }
-    pub async fn get_blocks(&self, heights: &[u32]) -> anyhow::Result<Vec<Block>> {
-        let mut blocks = Vec::with_capacity(heights.len());
-        for h in heights.iter(){
-            blocks.push(self.get_block(*h).await?);
-        }
-        Ok(blocks)
-    }
     pub async fn get_qd_block(&self, height: u32) -> anyhow::Result<QDogeBlock> {
         btc_block_to_qdoge(&self.get_block(height).await?)
     }
-    pub async fn get_qd_blocks(&self, heights: &[u32]) -> anyhow::Result<Vec<QDogeBlock>> {
-        let mut blocks = Vec::with_capacity(heights.len());
-        for h in heights.iter(){
-            blocks.push(self.get_qd_block(*h).await?);
-        }
-        Ok(blocks)
-    }
-    pub async fn get_qd_block_header(&self, height: u32) -> anyhow::Result<QDogeBlockHeader> {
-        let btc_header = self.get_block_header(height).await?;
-        Ok(btc_block_header_to_qdoge(&btc_header)?)
-    }
-    pub async fn get_qd_block_header_by_hash(&self, hash: Hash256) -> anyhow::Result<QDogeBlockHeader> {
-        let btc_header = self.get_block_header_by_hash(hash).await?;
-        Ok(btc_block_header_to_qdoge(&btc_header)?)
-    }
-    pub async fn get_qd_block_headers(&self, heights: &[u32]) -> anyhow::Result<Vec<QDogeBlockHeader>> {
-        let mut headers = Vec::with_capacity(heights.len());
-        for h in heights.iter(){
-            headers.push(self.get_qd_block_header(*h).await?);
-        }
-        Ok(headers)
-    }
-    pub async fn get_qd_block_headers_range(&self, start_height: u32, end_height: u32) -> anyhow::Result<Vec<QDogeBlockHeader>> {
-        let mut headers = Vec::with_capacity((end_height - start_height + 1) as usize);
-        for h in start_height..=end_height{
-            //println!("get header: {}",h);
-            headers.push(self.get_qd_block_header(h).await?);
-        }
-        Ok(headers)
+
+    async fn get_qd_block_header(&self, height: u32) -> anyhow::Result<QDogeBlockHeader> {
+        let hash = self.get_text(&format!("block-height/{height}")).await?;
+        let header_hex = self.get_text(&format!("block/{hash}/header")).await?;
+        let header: Header = bitcoin::consensus::encode::deserialize(&hex::decode(header_hex)?)?;
+        btc_block_header_to_qdoge(&header)
     }
 
     pub async fn get_qd_block_headers_range_parallel(&self, start_height: u32, end_height: u32) -> anyhow::Result<Vec<QDogeBlockHeader>> {
@@ -141,15 +119,6 @@ impl DogeLinkElectrsAsyncClient {
         Ok(results)
     }
 
-    pub async fn get_block_status_by_hash(&self, block_hash: Hash256) -> anyhow::Result<DogeLinkBlockStatusResponse> {
-        let mut base: DogeLinkBlockStatusResponse = self.get_json(&format!("block/{}/status", block_hash.to_reversed_hex_string())).await?;
-        if base.next_best.is_some() {
-            let mut d = base.next_best.unwrap().0;
-            d.reverse();
-            base.next_best = Some(Hash256(d));
-        }
-        Ok(base)
-    }
 }
 
 

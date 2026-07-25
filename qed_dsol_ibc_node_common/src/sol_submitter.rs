@@ -24,28 +24,12 @@ substantial portions of the software:
 with contributions from Carter Feldman (https://x.com/cmpeq)."
 */
 
-use borsh::BorshDeserialize;
-use qed_dsol_bridge_core::{config::network_constants::QEDDogeChainState, data::{scrypt_proof::DogeBlockScryptProofOutput, state::IBCBlockState}};
 use serde::{Deserialize, Serialize};
+use crate::network_retry::{
+    is_retryable_http_status, is_retryable_reqwest, NetworkRetryPolicy, RetryAction,
+};
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SSCInitIBCStateRequestBody {
-    pub data: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SSCInitContractStateRequestBody {
-    pub block_number: u32,
-    pub block_header_bytes: String,
-    pub scrypt_hash: String,
-    pub proof: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SCCGetIBCStateResponse {
-    pub initialized: bool,
-    pub state: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,122 +50,107 @@ pub struct BlockUpdateResponse {
     pub idempotency_key: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AmbiguousBlockUpdateResponse {
+    status: String,
+    signature: String,
+    idempotency_key: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SolSubmitterClient {
     pub base_url: String,
     pub api_key: String,
     client: reqwest::Client,
+    retry_policy: NetworkRetryPolicy,
 }
 impl SolSubmitterClient {
-    /// Constructs the legacy IBC-v3 client, whose existing methods use x-api-key.
-
-    pub fn new(url: String, api_key: String) -> anyhow::Result<Self> {
-        Self::build(url, api_key)
-    }
     pub fn new_with_bearer_token(url: String, bearer_token: String) -> anyhow::Result<Self> {
         Self::build(url, bearer_token)
     }
 
     fn build(url: String, api_key: String) -> anyhow::Result<Self> {
+        let retry_policy = NetworkRetryPolicy::default();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(retry_policy.request_timeout())
             .build()?;
-        Ok(Self { base_url: format!("{}/api/v1", url), api_key, client })
+        Ok(Self {
+            base_url: format!("{}/api/v1", url),
+            api_key,
+            client,
+            retry_policy,
+        })
     }
 
-    pub async fn init_ibc_program_state(&self, block_state_bytes: &[u8]) -> anyhow::Result<()> {
-        let url = format!("{}/init-ibc", self.base_url);
-        let client = &self.client;
-        let res = client.post(&url)
-            .header("x-api-key", self.api_key.clone())
-            .json(&SSCInitIBCStateRequestBody {
-                data: hex::encode(block_state_bytes),
-            })
-            .send()
-            .await?;
-        let status = res.status();
-        if status.is_success() {
-            let resp = res.text().await?;
-            println!("Init IBC block state response: {}", resp);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Failed to init IBC block state: {:?}", res.text().await?))
-        }
-    }
-    pub async fn get_ibc_program_state_full(&self) -> anyhow::Result<Option<QEDDogeChainState>> {
-        match self.get_ibc_program_state_inner().await? {
-            Some(state_bytes) => {
-                match QEDDogeChainState::try_from_slice(&state_bytes[33..]) {
-                    Ok(state) => Ok(Some(state)),
-                    Err(e) => Err(anyhow::anyhow!("Failed to parse IBC block state: {:?}", e)),
-                }
-            }
-            None => Ok(None),
-        }
-    }
-    pub async fn get_ibc_program_state_inner(&self) -> anyhow::Result<Option<Vec<u8>>> {
-        let url = format!("{}/get-ibc-state", self.base_url);
-        let client = &self.client;
-        let res = client.get(&url)
-            .header("x-api-key", self.api_key.clone())
-            .send()
-            .await?;
-        let status = res.status();
-        if status.is_success() {
-            let resp: SCCGetIBCStateResponse = res.json().await?;
-            if resp.initialized {
-                Ok(Some(hex::decode(resp.state.unwrap())?))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Err(anyhow::anyhow!("Failed to get IBC block state: {:?}", res.text().await?))
-        }
-    }
-
-    pub async fn append_block_zkp(&self, block_height: u32, block_header_bytes: &[u8], proof_result: &DogeBlockScryptProofOutput) -> anyhow::Result<()> {
-        let url = format!("{}/append-block-zkp", self.base_url);
-        let client = &self.client;
-        let res = client.post(&url)
-            .header("x-api-key", self.api_key.clone())
-            .json(&SSCInitContractStateRequestBody {
-                block_number: block_height,
-                block_header_bytes: hex::encode(block_header_bytes),
-                scrypt_hash: hex::encode(&proof_result.scrypt_hash),
-                proof: hex::encode(&proof_result.groth16_proof),
-            })
-            .send()
-            .await?;
-        let status = res.status();
-        if status.is_success() {
-            let resp = res.text().await?;
-            println!("Submit block result response: {}", resp);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Failed to submit block result: {:?}", res.text().await?))
-        }
-    }
     /// Submits the current bridge block_update contract using optional Bearer auth.
     pub async fn block_update(
         &self,
         request: &BlockUpdateRequestBody,
     ) -> anyhow::Result<BlockUpdateResponse> {
         let url = format!("{}/block-update", self.base_url);
-        let client = &self.client;
-        let mut builder = client.post(&url).json(request);
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
-        }
-        let response = builder.send().await?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(response.json().await?)
-        } else {
-            Err(anyhow::anyhow!(
-                "block-update submission failed with HTTP {}: {}",
-                status,
-                response.text().await?
-            ))
-        }
+        self.retry_policy
+            .run("Sender block_update request", || async {
+                let mut builder = self.client.post(&url).json(request);
+                if !self.api_key.is_empty() {
+                    builder = builder.bearer_auth(&self.api_key);
+                }
+                let response = match builder.send().await {
+                    Ok(response) => response,
+                    Err(error) if is_retryable_reqwest(&error) => {
+                        return RetryAction::Retry(anyhow::Error::new(error));
+                    }
+                    Err(error) => return RetryAction::Fatal(anyhow::Error::new(error)),
+                };
+                let status = response.status();
+                if status == reqwest::StatusCode::ACCEPTED {
+                    return match response.json::<AmbiguousBlockUpdateResponse>().await {
+                        Ok(ambiguous) if ambiguous.status == "ambiguous" => RetryAction::Fatal(
+                            anyhow::anyhow!(
+                                "block-update submission outcome is ambiguous for signature {} and idempotency key {}",
+                                ambiguous.signature,
+                                ambiguous.idempotency_key
+                            ),
+                        ),
+                        Ok(ambiguous) => RetryAction::Fatal(anyhow::anyhow!(
+                            "unexpected accepted block-update status '{}'",
+                            ambiguous.status
+                        )),
+                        Err(error) if is_retryable_reqwest(&error) => {
+                            RetryAction::Retry(anyhow::Error::new(error))
+                        }
+                        Err(error) => RetryAction::Fatal(anyhow::Error::new(error)),
+                    };
+                }
+                if status.is_success() {
+                    return match response.json::<BlockUpdateResponse>().await {
+                        Ok(response) => RetryAction::Success(response),
+                        Err(error) if is_retryable_reqwest(&error) => {
+                            RetryAction::Retry(anyhow::Error::new(error))
+                        }
+                        Err(error) => RetryAction::Fatal(anyhow::Error::new(error)),
+                    };
+                }
+                let retryable = is_retryable_http_status(status.as_u16());
+                let body = match response.text().await {
+                    Ok(body) => body,
+                    Err(error) if is_retryable_reqwest(&error) => {
+                        return RetryAction::Retry(anyhow::Error::new(error));
+                    }
+                    Err(error) => return RetryAction::Fatal(anyhow::Error::new(error)),
+                };
+                let error = anyhow::anyhow!(
+                    "block-update submission failed with HTTP {}: {}",
+                    status,
+                    body
+                );
+                if retryable {
+                    RetryAction::Retry(error)
+                } else {
+                    RetryAction::Fatal(error)
+                }
+            })
+            .await
     }
 }
