@@ -75,6 +75,10 @@ use tokio::task::JoinHandle;
 use crate::{
     doge_link_rpc_async::DogeLinkElectrsAsyncClient,
     network_retry::{has_retryable_io_source, is_retryable_reqwest, NetworkRetryPolicy, RetryAction},
+    proof_queue::{
+        file_sha256_hex, proof_namespace, ProofBackend, ProofJob, ProofRequest, ProofTicket,
+        ProverBackendKind,
+    },
     sol_submitter::{BlockUpdateRequestBody, SolSubmitterClient},
 };
 
@@ -178,6 +182,11 @@ pub struct BlockPipelineConfig {
     pub evidence_dir: PathBuf,
     pub poll_interval: Duration,
     pub redis_seed: u64,
+    pub prover_backend: crate::proof_queue::ProverBackendKind,
+    pub proof_prepare_window: usize,
+    pub proof_queue_prefix: String,
+    pub proof_wait_interval: Duration,
+    pub proof_requeue_limit: usize,
     pub start_height: Option<u32>,
     pub old_state_dir: Option<PathBuf>,
     pub witness_dir: Option<PathBuf>,
@@ -409,16 +418,16 @@ struct ClaimEvaluation {
     minted_amount_sats: u64,
 }
 
-struct ProverOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    vk_hash: [u8; 32],
-    proof: Vec<u8>,
-    public_values: Vec<u8>,
+pub(crate) struct ProverOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) vk_hash: [u8; 32],
+    pub(crate) proof: Vec<u8>,
+    pub(crate) public_values: Vec<u8>,
 }
 
 #[derive(Debug)]
-struct ProverRequestError(String);
+pub(crate) struct ProverRequestError(pub(crate) String);
 
 impl std::fmt::Display for ProverRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -427,6 +436,17 @@ impl std::fmt::Display for ProverRequestError {
 }
 
 impl std::error::Error for ProverRequestError {}
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProofDisposition {
+    Preparing,
+    Waiting,
+    Failed,
+    Validated,
+}
+
+const fn commit_may_start(disposition: ProofDisposition) -> bool {
+    matches!(disposition, ProofDisposition::Validated)
+}
 
 #[derive(Debug, Deserialize)]
 struct ProverIdentityResponse {
@@ -455,20 +475,6 @@ struct ProverProofResponse {
     error: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ProverProofRequest<'a> {
-    request_id: &'a str,
-    old_state: String,
-    witness: String,
-    custody_script_config: String,
-    required_confirmations: u32,
-    flat_fee: u64,
-    fee_num: u64,
-    fee_den: u64,
-    old_header: String,
-    new_header: String,
-    config_params: String,
-}
 
 const MAX_PROVER_DIAGNOSTICS_BYTES: usize = 256 * 1024;
 /// SP1 daemon phase budgets passed explicitly to `gen-proof` so the IBC and
@@ -517,7 +523,7 @@ const REDIS_INIT_DEADLINE: Duration = Duration::from_secs(30);
 /// Top-level deadline for critical Redis checkpoint read/write operations.
 const REDIS_CHECKPOINT_DEADLINE: Duration = Duration::from_secs(30);
 
-struct ProverDaemon {
+pub(crate) struct ProverDaemon {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -527,7 +533,7 @@ struct ProverDaemon {
 }
 
 impl ProverDaemon {
-    async fn start(config: &BlockPipelineConfig) -> anyhow::Result<Self> {
+    pub(crate) async fn start(config: &BlockPipelineConfig) -> anyhow::Result<Self> {
         let mut command = Command::new(&config.gen_proof_path);
         command
             .arg("--network")
@@ -625,29 +631,13 @@ impl ProverDaemon {
         Ok(daemon)
     }
 
-    async fn prove(
+    pub(crate) async fn prove(
         &mut self,
         config: &BlockPipelineConfig,
-        request_id: &str,
-        old_state: &[u8],
-        witness: &[u8],
-        old_header: &[u8; HEADER_SIZE],
-        new_header: &[u8; HEADER_SIZE],
+        request: &crate::proof_queue::ProofRequest,
     ) -> anyhow::Result<ProverOutput> {
-        let request = ProverProofRequest {
-            request_id,
-            old_state: hex::encode(old_state),
-            witness: hex::encode(witness),
-            custody_script_config: hex::encode(config.custody_script_config),
-            required_confirmations: config.required_confirmations,
-            flat_fee: deposit_flat_fee(&config.config_params),
-            fee_num: deposit_fee_numerator(&config.config_params),
-            fee_den: deposit_fee_denominator(&config.config_params),
-            old_header: hex::encode(old_header),
-            new_header: hex::encode(new_header),
-            config_params: hex::encode(config.config_params),
-        };
-        let mut request_line = serde_json::to_vec(&request)?;
+        let request_id = &request.request_id;
+        let mut request_line = serde_json::to_vec(request)?;
         request_line.push(b'\n');
 
         let response_line = tokio::time::timeout(PROVER_PROOF_DEADLINE, async {
@@ -798,7 +788,7 @@ impl ProverDaemon {
         self.take_stderr().await
     }
 
-    async fn terminate(mut self) {
+    pub(crate) async fn terminate(mut self) {
         drop(self.stdin);
         match tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await {
             Ok(Ok(_)) => {}
@@ -813,10 +803,6 @@ impl ProverDaemon {
     }
 }
 
-enum ProverProcess {
-    Daemon(ProverDaemon),
-    Stopped,
-}
 
 #[derive(Serialize)]
 struct ProverInputsEvidence {
@@ -854,6 +840,55 @@ struct MintProcessingEvidence {
     total_mints_processed: usize,
 }
 
+struct PreparedTransition {
+    height: u32,
+    next_checkpoint: PipelineCheckpoint,
+    proof_job: ProofJob,
+    old_state_bytes: Vec<u8>,
+    witness_bytes: Vec<u8>,
+    old_header: [u8; HEADER_SIZE],
+    new_header: [u8; HEADER_SIZE],
+    evaluation: ClaimEvaluation,
+    finalized_height: u32,
+    finalized_buffers: BlockBufferCommitment,
+    idempotency_key: String,
+}
+
+struct InflightProof {
+    prepared: PreparedTransition,
+    ticket: ProofTicket,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SimulatedProofState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OrderedProofAction {
+    Idle,
+    Wait(u32),
+    Commit(u32),
+    Fail(u32),
+}
+
+fn ordered_proof_action(
+    committed_height: u32,
+    inflight: &BTreeMap<u32, SimulatedProofState>,
+) -> OrderedProofAction {
+    let Some(expected) = committed_height.checked_add(1) else {
+        return OrderedProofAction::Idle;
+    };
+    match inflight.get(&expected) {
+        None => OrderedProofAction::Idle,
+        Some(SimulatedProofState::Pending) => OrderedProofAction::Wait(expected),
+        Some(SimulatedProofState::Ready) => OrderedProofAction::Commit(expected),
+        Some(SimulatedProofState::Failed) => OrderedProofAction::Fail(expected),
+    }
+}
+
 pub struct BlockPipeline {
     config: BlockPipelineConfig,
     block_rpc: DogeLinkElectrsAsyncClient,
@@ -862,7 +897,9 @@ pub struct BlockPipeline {
     redis: fred::prelude::Pool,
     checkpoint_key: String,
     checkpoint: PipelineCheckpoint,
-    prover: ProverProcess,
+    proof_backend: ProofBackend,
+    planned_checkpoint: PipelineCheckpoint,
+    inflight: BTreeMap<u32, InflightProof>,
     network_retry: NetworkRetryPolicy,
 }
 
@@ -946,7 +983,19 @@ impl BlockPipeline {
         .await?;
         assert_checkpoint_matches_chain(&checkpoint, &chain_state.bridge_header)?;
 
-        let prover = ProverProcess::Daemon(ProverDaemon::start(&config).await?);
+        let proof_backend = match config.prover_backend {
+            ProverBackendKind::Local => ProofBackend::local(config.clone()).await?,
+            ProverBackendKind::Redis => ProofBackend::redis(
+                redis.clone(),
+                proof_namespace(
+                    &config.proof_queue_prefix,
+                    config.network.as_str(),
+                    config.redis_seed,
+                ),
+                config.proof_wait_interval,
+                config.proof_requeue_limit,
+            ),
+        };
         eprintln!(
             "block pipeline started: network={} checkpoint={} sender={} electrs={}",
             config.network.as_str(),
@@ -963,9 +1012,11 @@ impl BlockPipeline {
             block_rpc,
             redis,
             checkpoint_key,
+            planned_checkpoint: checkpoint.clone(),
             checkpoint,
             config,
-            prover,
+            proof_backend,
+            inflight: BTreeMap::new(),
             network_retry,
         })
     }
@@ -1009,20 +1060,20 @@ impl BlockPipeline {
     }
 
     async fn shutdown(&mut self) {
-        let prover = std::mem::replace(&mut self.prover, ProverProcess::Stopped);
-        if let ProverProcess::Daemon(prover) = prover {
-            prover.terminate().await;
-        }
+        self.proof_backend.shutdown().await;
     }
 
     pub async fn poll_once(&mut self) -> anyhow::Result<bool> {
-        // Overall wall-clock watchdog for a single poll. The phase label and
-        // the in-flight height are surfaced in the watchdog error so an
-        // operator can see where the pipeline stalled without per-step
-        // diagnostic logging.
         const PHASE_FETCH_TIP: u8 = 0;
-        const PHASE_PROCESS_HEIGHT: u8 = 1;
-        const POLL_PHASE_NAMES: [&str; 2] = ["fetch-electrs-tip", "process-height"];
+        const PHASE_PREPARE: u8 = 1;
+        const PHASE_WAIT_PROOF: u8 = 2;
+        const PHASE_COMMIT: u8 = 3;
+        const POLL_PHASE_NAMES: [&str; 4] = [
+            "fetch-electrs-tip",
+            "prepare-height",
+            "wait-proof",
+            "commit-prepared",
+        ];
         let phase = Arc::new(AtomicU8::new(PHASE_FETCH_TIP));
         let in_flight_height = Arc::new(AtomicU32::new(0));
         let body_phase = Arc::clone(&phase);
@@ -1032,31 +1083,68 @@ impl BlockPipeline {
             body_phase.store(PHASE_FETCH_TIP, Ordering::Relaxed);
             let electrs_tip = self.block_rpc.get_block_height().await?;
             let finalized_tip = electrs_tip.saturating_sub(self.config.required_confirmations);
-            let next_height = self
+            let mut did_work = false;
+
+            while self.inflight.len() < self.config.proof_prepare_window
+                && self.planned_checkpoint.height < finalized_tip
+            {
+                let height = self
+                    .planned_checkpoint
+                    .height
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("planned checkpoint height overflow"))?;
+                body_height.store(height, Ordering::Relaxed);
+                body_phase.store(PHASE_PREPARE, Ordering::Relaxed);
+                let base_checkpoint = self.planned_checkpoint.clone();
+                let prepared = match self.config.network {
+                    DogeNetworkProfile::Regtest => {
+                        self.prepare_height::<DogeRegTestConfig, LocalRegtestManagerCustody>(
+                            &base_checkpoint,
+                            height,
+                        )
+                        .await?
+                    }
+                    DogeNetworkProfile::Testnet => {
+                        self.prepare_height::<DogeTestNetConfig, OfficialTestnetManagerCustody>(
+                            &base_checkpoint,
+                            height,
+                        )
+                        .await?
+                    }
+                };
+                let ticket = self
+                    .proof_backend
+                    .submit(prepared.proof_job.clone())
+                    .await?;
+                self.planned_checkpoint = prepared.next_checkpoint.clone();
+                if self
+                    .inflight
+                    .insert(height, InflightProof { prepared, ticket })
+                    .is_some()
+                {
+                    anyhow::bail!("duplicate in-flight proof height {height}");
+                }
+                did_work = true;
+            }
+
+            let expected_height = self
                 .checkpoint
                 .height
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
-            body_height.store(next_height, Ordering::Relaxed);
-            if next_height > finalized_tip {
-                return Ok(false);
-            }
-            body_phase.store(PHASE_PROCESS_HEIGHT, Ordering::Relaxed);
-            match self.config.network {
-                DogeNetworkProfile::Regtest => {
-                    self.process_height::<DogeRegTestConfig, LocalRegtestManagerCustody>(
-                        next_height,
+            if let Some(inflight) = self.inflight.remove(&expected_height) {
+                body_height.store(expected_height, Ordering::Relaxed);
+                body_phase.store(PHASE_WAIT_PROOF, Ordering::Relaxed);
+                let proof = self.proof_backend.wait(inflight.ticket).await.map_err(|error| {
+                    anyhow::anyhow!(
+                        "proof for ordered height {expected_height} failed; suffix will not be committed: {error:#}"
                     )
-                    .await?
-                }
-                DogeNetworkProfile::Testnet => {
-                    self.process_height::<DogeTestNetConfig, OfficialTestnetManagerCustody>(
-                        next_height,
-                    )
-                    .await?
-                }
+                })?;
+                body_phase.store(PHASE_COMMIT, Ordering::Relaxed);
+                self.commit_prepared(inflight.prepared, proof).await?;
+                did_work = true;
             }
-            Ok(true)
+            Ok(did_work)
         };
 
         tokio::select! {
@@ -1072,81 +1160,12 @@ impl BlockPipeline {
         }
     }
 
-    async fn run_gen_proof(
-        &mut self,
+
+    async fn prepare_height<NC: DogeNetworkConfig, P: ManagerCustodyProfile>(
+        &self,
+        checkpoint: &PipelineCheckpoint,
         height: u32,
-        old_state: &[u8],
-        witness: &[u8],
-        old_header: &[u8; HEADER_SIZE],
-        new_header: &[u8; HEADER_SIZE],
-    ) -> anyhow::Result<ProverOutput> {
-        if matches!(&self.prover, ProverProcess::Stopped) {
-            anyhow::bail!("gen-proof daemon is stopped");
-        }
-
-        prepare_prover_request(&self.config, old_state, witness, old_header, new_header).await?;
-        let request_id = format!("block-{height}");
-        let first_result = match &mut self.prover {
-            ProverProcess::Daemon(prover) => {
-                prover
-                    .prove(
-                        &self.config,
-                        &request_id,
-                        old_state,
-                        witness,
-                        old_header,
-                        new_header,
-                    )
-                    .await
-            }
-            ProverProcess::Stopped => unreachable!("checked above"),
-        };
-        let first_error = match first_result {
-            Ok(output) => return Ok(output),
-            Err(error) if error.downcast_ref::<ProverRequestError>().is_some() => {
-                return Err(error);
-            }
-            Err(error) => error,
-        };
-
-        let old_process = std::mem::replace(&mut self.prover, ProverProcess::Stopped);
-        if let ProverProcess::Daemon(prover) = old_process {
-            prover.terminate().await;
-        }
-        let mut prover = ProverDaemon::start(&self.config).await.map_err(|restart_error| {
-            anyhow::anyhow!(
-                "gen-proof daemon request failed: {first_error:#}; restart/revalidation failed: {restart_error:#}"
-            )
-        })?;
-        let retry_result = prover
-            .prove(
-                &self.config,
-                &request_id,
-                old_state,
-                witness,
-                old_header,
-                new_header,
-            )
-            .await;
-        match retry_result {
-            Ok(output) => {
-                self.prover = ProverProcess::Daemon(prover);
-                Ok(output)
-            }
-            Err(retry_error) => {
-                prover.terminate().await;
-                Err(anyhow::anyhow!(
-                    "gen-proof daemon request failed: {first_error:#}; retry after restart failed: {retry_error:#}"
-                ))
-            }
-        }
-    }
-
-    async fn process_height<NC: DogeNetworkConfig, P: ManagerCustodyProfile>(
-        &mut self,
-        height: u32,
-    ) -> anyhow::Result<()> {
-        let checkpoint = self.checkpoint.clone();
+    ) -> anyhow::Result<PreparedTransition> {
         let generated_state_bytes = hex::decode(&checkpoint.state_hex)?;
         let old_state_bytes = read_optional_height_artifact(
             self.config.old_state_dir.as_ref(),
@@ -1320,6 +1339,115 @@ impl BlockPipeline {
             pending_finalization,
         };
         validate_checkpoint(&next_checkpoint)?;
+        let request = ProofRequest {
+            request_id: format!("block-{height}"),
+            old_state: hex::encode(&old_state_bytes),
+            witness: hex::encode(&witness_bytes),
+            custody_script_config: hex::encode(self.config.custody_script_config),
+            required_confirmations: self.config.required_confirmations,
+            flat_fee: deposit_flat_fee(&self.config.config_params),
+            fee_num: deposit_fee_numerator(&self.config.config_params),
+            fee_den: deposit_fee_denominator(&self.config.config_params),
+            old_header: hex::encode(old_header),
+            new_header: hex::encode(new_header),
+            config_params: hex::encode(self.config.config_params),
+        };
+        let proof_job = ProofJob::new(
+            self.config.network.as_str().to_owned(),
+            height,
+            sha256_hex(&serde_json::to_vec(checkpoint)?),
+            self.config.network.guest_id().to_owned(),
+            file_sha256_hex(&self.config.block_elf_path).await?,
+            hex::encode(self.config.expected_vk_hash),
+            request,
+        )?;
+        Ok(PreparedTransition {
+            height,
+            next_checkpoint,
+            proof_job,
+            old_state_bytes,
+            witness_bytes,
+            old_header,
+            new_header,
+            evaluation,
+            finalized_height,
+            finalized_buffers,
+            idempotency_key: format!(
+                "doge-block-{height}-{}",
+                hex::encode(witness.block_header.header.get_hash())
+            ),
+        })
+    }
+
+    async fn commit_prepared(
+        &mut self,
+        prepared: PreparedTransition,
+        prover_output: ProverOutput,
+    ) -> anyhow::Result<()> {
+        let expected_height = self
+            .checkpoint
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint height overflow"))?;
+        if prepared.height != expected_height || prepared.next_checkpoint.height != expected_height {
+            anyhow::bail!(
+                "prepared height {} is not the next committed height {expected_height}",
+                prepared.height
+            );
+        }
+        let expected_parent = sha256_hex(&serde_json::to_vec(&self.checkpoint)?);
+        if prepared.proof_job.parent_checkpoint_sha256 != expected_parent {
+            anyhow::bail!(
+                "prepared height {} parent checkpoint fingerprint no longer matches committed tip",
+                prepared.height
+            );
+        }
+        let PreparedTransition {
+            height,
+            next_checkpoint,
+            old_state_bytes,
+            witness_bytes,
+            old_header,
+            new_header,
+            evaluation,
+            finalized_height,
+            finalized_buffers,
+            idempotency_key,
+            ..
+        } = prepared;
+        let proof = &prover_output.proof;
+        let public_values = &prover_output.public_values;
+        ensure_length("SP1 proof", proof, PROOF_SIZE)?;
+        ensure_length("SP1 public values", public_values, PUBLIC_VALUES_SIZE)?;
+        if proof.iter().all(|byte| *byte == 0) {
+            anyhow::bail!("SP1 proof is an all-zero placeholder");
+        }
+        let old_header_hash = hash_impl_sha256_bytes(&old_header);
+        let new_header_hash = hash_impl_sha256_bytes(&new_header);
+        let config_hash = hash_impl_sha256_bytes(&self.config.config_params);
+        let custodian_hash = self
+            .config
+            .network
+            .custodian_hash(self.config.custody_script_config);
+        let transition_hash = hash_impl_sha256_two_to_one_bytes(
+            &old_header_hash,
+            &new_header_hash,
+        );
+        let expected_public_values = hash_impl_sha256_bytes(
+            &[
+                transition_hash.as_slice(),
+                config_hash.as_slice(),
+                custodian_hash.as_slice(),
+            ]
+            .concat(),
+        );
+        if public_values.as_slice() != expected_public_values {
+            anyhow::bail!(
+                "SP1 public values do not bind the prepared transition at height {height}"
+            );
+        }
+
+        debug_assert!(commit_may_start(ProofDisposition::Validated));
         let journal_key = checkpoint_journal_key(&self.checkpoint_key);
         self.redis
             .set::<(), _, _>(
@@ -1336,28 +1464,7 @@ impl BlockPipeline {
                 false,
             )
             .await?;
-        let prover_output = self
-            .run_gen_proof(
-                height,
-                &old_state_bytes,
-                &witness_bytes,
-                &old_header,
-                &new_header,
-            )
-            .await?;
 
-        let proof = &prover_output.proof;
-        let public_values = &prover_output.public_values;
-        ensure_length("SP1 proof", proof, PROOF_SIZE)?;
-        ensure_length("SP1 public values", public_values, PUBLIC_VALUES_SIZE)?;
-        if proof.iter().all(|byte| *byte == 0) {
-            anyhow::bail!("SP1 proof is an all-zero placeholder");
-        }
-
-        let idempotency_key = format!(
-            "doge-block-{height}-{}",
-            hex::encode(witness.block_header.header.get_hash())
-        );
         let uploaded_buffers = self
             .upload_finalized_buffers(finalized_height, &finalized_buffers)
             .await?;
@@ -1415,8 +1522,6 @@ impl BlockPipeline {
                 idempotency_key
             );
         }
-        // Persist the accepted block_update signature so a crash between
-        // here and mint completion can reconcile without resubmitting.
         self.redis
             .set::<(), _, _>(
                 &journal_key,
@@ -1435,8 +1540,6 @@ impl BlockPipeline {
         let mint_processing = self
             .process_finalized_mints(&finalized_buffers, &uploaded_buffers)
             .await?;
-        // Persist mint progress so a crash after this point promotes the
-        // checkpoint directly on recovery instead of re-running mints.
         self.redis
             .set::<(), _, _>(
                 &journal_key,
@@ -1462,9 +1565,7 @@ impl BlockPipeline {
                 false,
             )
             .await?;
-        self.redis
-            .del::<(), _>(&journal_key)
-            .await?;
+        self.redis.del::<(), _>(&journal_key).await?;
 
         evidence.status = "minted".to_owned();
         evidence.submission_signature = Some(response.signature);
@@ -2551,26 +2652,23 @@ fn build_new_solana_header(
 
 
 
-async fn prepare_prover_request(
+pub(crate) async fn prepare_prover_request(
     config: &BlockPipelineConfig,
-    old_state: &[u8],
-    witness: &[u8],
-    old_header: &[u8; HEADER_SIZE],
-    new_header: &[u8; HEADER_SIZE],
+    request: &crate::proof_queue::ProofRequest,
 ) -> anyhow::Result<()> {
     if std::env::var_os("DOGE_SAVE_PROVER_ARGS").is_some() {
         let args = serde_json::json!({
             "network": config.network.as_str(),
-            "old_state": hex::encode(old_state),
-            "witness": hex::encode(witness),
-            "custody_script_config": hex::encode(config.custody_script_config),
-            "required_confirmations": config.required_confirmations,
-            "flat_fee": deposit_flat_fee(&config.config_params),
-            "fee_num": deposit_fee_numerator(&config.config_params),
-            "fee_den": deposit_fee_denominator(&config.config_params),
-            "old_header": hex::encode(old_header),
-            "new_header": hex::encode(new_header),
-            "config_params": hex::encode(config.config_params),
+            "old_state": request.old_state,
+            "witness": request.witness,
+            "custody_script_config": request.custody_script_config,
+            "required_confirmations": request.required_confirmations,
+            "flat_fee": request.flat_fee,
+            "fee_num": request.fee_num,
+            "fee_den": request.fee_den,
+            "old_header": request.old_header,
+            "new_header": request.new_header,
+            "config_params": request.config_params,
         });
         tokio::fs::write(
             "/tmp/psy-block-prover-args.json",
@@ -2960,17 +3058,27 @@ fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+fn validate_gen_proof_path(
+    prover_backend: ProverBackendKind,
+    gen_proof_path: &Path,
+) -> anyhow::Result<()> {
+    if prover_backend == ProverBackendKind::Redis {
+        return Ok(());
+    }
+    if !gen_proof_path.is_file() {
+        anyhow::bail!(
+            "SP1 gen-proof executable does not exist at {}",
+            gen_proof_path.display()
+        );
+    }
+    ensure_release_path(gen_proof_path, "SP1 gen-proof")
+}
+
 fn validate_config(config: &BlockPipelineConfig) -> anyhow::Result<()> {
     if cfg!(debug_assertions) {
         anyhow::bail!("block pipeline must be built in release mode");
     }
-    if !config.gen_proof_path.is_file() {
-        anyhow::bail!(
-            "SP1 gen-proof executable does not exist at {}",
-            config.gen_proof_path.display()
-        );
-    }
-    ensure_release_path(&config.gen_proof_path, "SP1 gen-proof")?;
+    validate_gen_proof_path(config.prover_backend, &config.gen_proof_path)?;
     if !config.block_elf_path.is_file() {
         anyhow::bail!(
             "block-transition ELF does not exist at {}",
@@ -2995,6 +3103,18 @@ fn validate_config(config: &BlockPipelineConfig) -> anyhow::Result<()> {
     }
     if deposit_fee_denominator(&config.config_params) == 0 {
         anyhow::bail!("deposit fee denominator must be non-zero");
+    }
+    if config.proof_prepare_window == 0 {
+        anyhow::bail!("proof prepare window must be at least 1");
+    }
+    if config.proof_queue_prefix.trim().is_empty() {
+        anyhow::bail!("proof queue prefix must not be empty");
+    }
+    if config.proof_wait_interval.is_zero() {
+        anyhow::bail!("proof wait interval must be non-zero");
+    }
+    if config.proof_requeue_limit == 0 {
+        anyhow::bail!("proof requeue limit must be at least 1");
     }
     let expected_bridge_state =
         Pubkey::find_program_address(&[b"bridge_state"], &config.bridge_program).0;
@@ -3463,6 +3583,38 @@ mod tests {
     #[cfg(unix)]
     use tokio::process::Command;
 
+    #[test]
+    fn redis_backend_does_not_require_local_gen_proof_path() {
+        let missing_path = std::env::temp_dir().join(format!(
+            "missing-redis-gen-proof-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        assert!(!missing_path.exists());
+
+        validate_gen_proof_path(ProverBackendKind::Redis, &missing_path)
+            .expect("Redis proving must not require a local gen-proof executable");
+    }
+
+    #[test]
+    fn local_backend_rejects_missing_gen_proof_path() {
+        let missing_path = std::env::temp_dir().join(format!(
+            "missing-local-gen-proof-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        assert!(!missing_path.exists());
+
+        let error = validate_gen_proof_path(ProverBackendKind::Local, &missing_path)
+            .expect_err("local proving must require a gen-proof executable");
+        assert!(
+            error
+                .to_string()
+                .contains("SP1 gen-proof executable does not exist"),
+            "{error:#}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn daemon_response_wait_reports_early_child_exit() {
@@ -3613,6 +3765,126 @@ mod tests {
         );
         daemon.terminate().await;
     }
+
+    #[test]
+    fn global_journal_starts_only_after_proof_validation() {
+        assert!(!commit_may_start(ProofDisposition::Preparing));
+        assert!(!commit_may_start(ProofDisposition::Waiting));
+        assert!(!commit_may_start(ProofDisposition::Failed));
+        assert!(commit_may_start(ProofDisposition::Validated));
+    }
+    #[test]
+    fn out_of_order_ready_proofs_commit_strictly_in_height_order() {
+        // Completion order is H+2, H, H+1. Only the committed tip's successor
+        // is ever eligible to commit.
+        let mut states = BTreeMap::from([
+            (43, SimulatedProofState::Pending),
+            (44, SimulatedProofState::Pending),
+            (45, SimulatedProofState::Ready),
+        ]);
+        let mut committed = 42;
+        assert_eq!(ordered_proof_action(committed, &states), OrderedProofAction::Wait(43));
+
+        states.insert(43, SimulatedProofState::Ready);
+        assert_eq!(ordered_proof_action(committed, &states), OrderedProofAction::Commit(43));
+        states.remove(&43);
+        committed = 43;
+        assert_eq!(ordered_proof_action(committed, &states), OrderedProofAction::Wait(44));
+
+        states.insert(44, SimulatedProofState::Ready);
+        let mut order = Vec::new();
+        while let OrderedProofAction::Commit(height) = ordered_proof_action(committed, &states) {
+            order.push(height);
+            states.remove(&height);
+            committed = height;
+        }
+        assert_eq!(order, vec![44, 45]);
+        assert_eq!(committed, 45);
+    }
+
+    #[test]
+    fn earlier_pending_or_failed_proof_blocks_ready_suffix() {
+        let mut states = BTreeMap::from([
+            (43, SimulatedProofState::Pending),
+            (44, SimulatedProofState::Ready),
+            (45, SimulatedProofState::Ready),
+        ]);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Wait(43));
+        states.insert(43, SimulatedProofState::Failed);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Fail(43));
+        assert_ne!(ordered_proof_action(42, &states), OrderedProofAction::Commit(44));
+    }
+
+    #[test]
+    fn window_one_retains_single_height_behavior() {
+        let states = BTreeMap::from([(43, SimulatedProofState::Ready)]);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Commit(43));
+        assert_eq!(ordered_proof_action(43, &states), OrderedProofAction::Idle);
+    }
+
+    #[test]
+    fn ordered_proof_action_never_commits_past_a_missing_height() {
+        // A gap in the in-flight map blocks the suffix: even though H+2 is
+        // Ready, the missing H+1 yields Idle rather than a Commit that would
+        // skip an unproven height. This is the strict H+1 ordering invariant.
+        let states = BTreeMap::from([(44, SimulatedProofState::Ready)]);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Idle);
+        assert_ne!(ordered_proof_action(42, &states), OrderedProofAction::Commit(44));
+        // An entry sitting at the committed tip is never the next height, so a
+        // stale/duplicate Ready at H does not re-commit H.
+        let states = BTreeMap::from([(42, SimulatedProofState::Ready)]);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Idle);
+    }
+
+    #[test]
+    fn ordered_proof_action_failed_height_blocks_every_ready_suffix_never_skips() {
+        // H+1 (43) permanently failed. In production the committed tip never
+        // advances past a failed height (the pipeline halts), so the only
+        // reachable state is committed==42 with 43==Failed. No matter how many
+        // suffix heights are Ready, the action stays Fail(43). A plausible bug
+        // that scanned for the first Ready height would Commit(44) and bypass
+        // the failure; this test reddens that bug.
+        let states = BTreeMap::from([
+            (43, SimulatedProofState::Failed),
+            (44, SimulatedProofState::Ready),
+            (45, SimulatedProofState::Ready),
+            (46, SimulatedProofState::Ready),
+        ]);
+        let action = ordered_proof_action(42, &states);
+        assert_eq!(action, OrderedProofAction::Fail(43));
+        assert_ne!(action, OrderedProofAction::Commit(44));
+        assert_ne!(action, OrderedProofAction::Commit(45));
+        assert_ne!(action, OrderedProofAction::Wait(43));
+    }
+
+    #[test]
+    fn ordered_proof_action_pending_height_waits_even_if_suffix_is_ready() {
+        // H+1 still proving while H+2 is Ready: the suffix must not commit
+        // ahead of the in-flight predecessor.
+        let states = BTreeMap::from([
+            (43, SimulatedProofState::Pending),
+            (44, SimulatedProofState::Ready),
+        ]);
+        assert_eq!(ordered_proof_action(42, &states), OrderedProofAction::Wait(43));
+        assert_ne!(ordered_proof_action(42, &states), OrderedProofAction::Commit(44));
+    }
+
+    #[test]
+    fn ordered_proof_action_at_u32_max_returns_idle_without_overflow() {
+        // The committed tip can reach u32::MAX; the next-height computation
+        // must use checked_add and yield Idle rather than panicking on wrap.
+        assert_eq!(
+            ordered_proof_action(u32::MAX, &BTreeMap::new()),
+            OrderedProofAction::Idle
+        );
+        // Even a Ready entry beyond the tip must not trigger an overflow.
+        let states = BTreeMap::from([(u32::MAX, SimulatedProofState::Ready)]);
+        assert_eq!(
+            ordered_proof_action(u32::MAX, &states),
+            OrderedProofAction::Idle
+        );
+    }
+
 
     #[test]
     fn checkpoint_journal_key_is_namespaced() {
