@@ -186,7 +186,6 @@ pub struct BlockPipelineConfig {
     pub proof_prepare_window: usize,
     pub proof_queue_prefix: String,
     pub proof_wait_interval: Duration,
-    pub proof_requeue_limit: usize,
     pub start_height: Option<u32>,
     pub old_state_dir: Option<PathBuf>,
     pub witness_dir: Option<PathBuf>,
@@ -993,7 +992,6 @@ impl BlockPipeline {
                     config.redis_seed,
                 ),
                 config.proof_wait_interval,
-                config.proof_requeue_limit,
             ),
         };
         eprintln!(
@@ -3112,9 +3110,6 @@ fn validate_config(config: &BlockPipelineConfig) -> anyhow::Result<()> {
     }
     if config.proof_wait_interval.is_zero() {
         anyhow::bail!("proof wait interval must be non-zero");
-    }
-    if config.proof_requeue_limit == 0 {
-        anyhow::bail!("proof requeue limit must be at least 1");
     }
     let expected_bridge_state =
         Pubkey::find_program_address(&[b"bridge_state"], &config.bridge_program).0;

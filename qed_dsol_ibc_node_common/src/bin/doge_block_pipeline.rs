@@ -78,10 +78,6 @@ struct Args {
     #[arg(long, env = "DOGE_PROOF_WAIT_INTERVAL_MS", default_value_t = 1_000)]
     proof_wait_interval_ms: u64,
 
-    #[arg(long, env = "DOGE_PROOF_REQUEUE_LIMIT", default_value_t = 100)]
-    proof_requeue_limit: usize,
-
-
     #[arg(long, env = "DOGE_START_HEIGHT")]
     start_height: Option<u32>,
 
@@ -159,7 +155,6 @@ async fn main() -> anyhow::Result<()> {
         proof_prepare_window: args.proof_prepare_window,
         proof_queue_prefix: args.proof_queue_prefix,
         proof_wait_interval: Duration::from_millis(args.proof_wait_interval_ms),
-        proof_requeue_limit: args.proof_requeue_limit,
         start_height: args.start_height,
         custody_script_config: read_fixed::<32>(
             &args.custody_script_config,

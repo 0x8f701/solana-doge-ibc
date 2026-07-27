@@ -32,28 +32,6 @@ redis.call('RPUSH', KEYS[4], ARGV[2])
 return 1
 "#;
 
-/// Requeues expired leases. The state check and queue insertion occur in the same script,
-/// preventing a late worker from completing after its fencing lease was revoked.
-pub const REQUEUE_EXPIRED_SCRIPT: &str = r#"
-local redis_time = redis.call('TIME')
-local now_ms = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
-local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms, 'LIMIT', 0, ARGV[1])
-local count = 0
-for _, job_id in ipairs(jobs) do
-  local state_key = ARGV[2] .. job_id
-  local raw = redis.call('GET', state_key)
-  if raw then
-    local ok, state = pcall(cjson.decode, raw)
-    if ok and state.status == 'Claimed' and tonumber(state.lease_expires_ms) <= now_ms then
-      redis.call('SET', state_key, '{\"status\":\"Queued\"}')
-      redis.call('RPUSH', KEYS[2], job_id)
-      count = count + 1
-    end
-  end
-  redis.call('ZREM', KEYS[1], job_id)
-end
-return count
-"#;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -472,15 +450,6 @@ pub fn fail_state(
     }
 }
 
-pub fn requeue_expired_state(state: &ProofJobState, now_ms: u64) -> Option<ProofJobState> {
-    match state {
-        ProofJobState::Claimed {
-            lease_expires_ms, ..
-        } if *lease_expires_ms <= now_ms => Some(ProofJobState::Queued),
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
 pub enum ProofBackend {
     Local(LocalProofBackend),
@@ -506,13 +475,11 @@ impl ProofBackend {
         pool: fred::prelude::Pool,
         namespace: String,
         wait_interval: Duration,
-        requeue_limit: usize,
     ) -> Self {
         Self::Redis(RedisProofBackend {
             pool,
             keys: QueueKeys::new(namespace),
             wait_interval,
-            requeue_limit,
         })
     }
 
@@ -689,10 +656,6 @@ impl QueueKeys {
     pub fn attempt(&self, job_id: &str) -> String {
         format!("{}:attempt:{job_id}", self.namespace)
     }
-
-    fn state_prefix(&self) -> String {
-        format!("{}:state:", self.namespace)
-    }
 }
 
 #[derive(Clone)]
@@ -700,7 +663,6 @@ pub struct RedisProofBackend {
     pool: fred::prelude::Pool,
     keys: QueueKeys,
     wait_interval: Duration,
-    requeue_limit: usize,
 }
 
 impl RedisProofBackend {
@@ -757,7 +719,6 @@ impl RedisProofBackend {
                 ProofJobState::Queued | ProofJobState::Claimed { .. } => {}
             }
 
-            self.requeue_expired().await?;
             let wait_secs = self.wait_interval.as_secs_f64().max(0.001);
             let notification = tokio::time::timeout(
                 self.wait_interval + Duration::from_secs(1),
@@ -773,19 +734,6 @@ impl RedisProofBackend {
                 }
             }
         }
-    }
-
-    pub async fn requeue_expired(&self) -> anyhow::Result<usize> {
-        let count = self
-            .pool
-            .eval::<i64, _, _, _>(
-                REQUEUE_EXPIRED_SCRIPT,
-                vec![self.keys.leases.clone(), self.keys.queue.clone()],
-                vec![self.requeue_limit.to_string(), self.keys.state_prefix()],
-            )
-            .await
-            .context("failed to requeue expired proof leases")?;
-        usize::try_from(count).context("Redis returned a negative expired-lease count")
     }
 }
 
@@ -931,29 +879,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn expired_claim_requeues_but_live_or_terminal_state_does_not() {
-        let claimed = claim_state(
-            &ProofJobState::Queued,
-            "worker".to_owned(),
-            "lease".to_owned(),
-            100,
-            1,
-        )
-        .unwrap();
-        assert_eq!(requeue_expired_state(&claimed, 100), Some(ProofJobState::Queued));
-        assert_eq!(requeue_expired_state(&claimed, 99), None);
-        assert_eq!(
-            requeue_expired_state(
-                &ProofJobState::Completed {
-                    completed_ms: 90,
-                    attempt: 1
-                },
-                100
-            ),
-            None
-        );
-    }
 
     #[test]
     fn namespace_and_keys_match_protocol() {
@@ -1248,14 +1173,13 @@ mod tests {
         tampered.schema_version = PROOF_SCHEMA_VERSION + 1;
         assert!(tampered.validate().is_err());
     }
-    /// Real-Redis behavior test for the two scripts the runtime actually uses
-    /// (`SUBMIT_JOB_SCRIPT`, `REQUEUE_EXPIRED_SCRIPT`). Ignored by default;
-    /// runs only when `TEST_REDIS_URL` points at an isolated instance the
-    /// test is allowed to mutate. Asserts observable Redis state/result/lease
-    /// transitions, not script text.
+    /// Real-Redis behavior test for durable submission and coordinator waiting.
+    /// Ignored by default; runs only when `TEST_REDIS_URL` points at an isolated
+    /// instance the test is allowed to mutate. Asserts observable Redis state
+    /// rather than script text.
     #[tokio::test]
     #[ignore = "requires an isolated Redis reachable via TEST_REDIS_URL"]
-    async fn redis_behavior_submit_and_requeue_scripts() {
+    async fn redis_behavior_submit_and_wait_preserves_expired_claim() {
         use fred::prelude::{Builder, ClientLike, Config, KeysInterface, ListInterface, LuaInterface};
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1264,7 +1188,7 @@ mod tests {
             .filter(|s| !s.is_empty())
         else {
             eprintln!(
-                "redis_behavior_submit_and_requeue_scripts: TEST_REDIS_URL not set; skipping"
+                "redis_behavior_submit_and_wait_preserves_expired_claim: TEST_REDIS_URL not set; skipping"
             );
             return;
         };
@@ -1292,7 +1216,7 @@ mod tests {
 
         // Run the assertions through a Result-returning helper so cleanup
         // always executes, even when an assertion fails.
-        let outcome = run_submit_and_requeue_behavior(&pool, &keys).await;
+        let outcome = run_submit_and_wait_behavior(&pool, &keys).await;
 
         // Exhaustive, hermetic cleanup: delete every key under this unique
         // namespace regardless of which ones the test actually created.
@@ -1310,10 +1234,10 @@ mod tests {
             "cleanup should have deleted keys under {namespace}* (deleted {deleted})"
         );
 
-        outcome.expect("submit/requeue behavior contract must hold");
+        outcome.expect("submit/wait behavior contract must hold");
     }
 
-    async fn run_submit_and_requeue_behavior(
+    async fn run_submit_and_wait_behavior(
         pool: &fred::prelude::Pool,
         keys: &QueueKeys,
     ) -> anyhow::Result<()> {
@@ -1397,45 +1321,60 @@ mod tests {
             "collision error must map to JOB_ID_COLLISION, got {err}"
         );
 
-        // ---- REQUEUE: seed an expired Claimed lease, then requeue it. ----
-        let claimed_id = "claimed-expired-job";
+        // ---- WAIT: an expired Claimed lease remains exclusively worker-owned. ----
+        // Model a worker claim by removing the queued entry, recording the
+        // durable Claimed state, and adding its expired lease. The coordinator
+        // must remain pending without changing any of those worker-owned keys.
+        let claimed_state = ProofJobState::Claimed {
+            worker_id: "worker-a".to_owned(),
+            lease_id: "lease-a".to_owned(),
+            lease_expires_ms: 1,
+            attempt: 3,
+        };
+        let claimed_json = serde_json::to_string(&claimed_state)?;
         pool.eval::<i64, _, _, _>(
-            r#"redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2]) return 1"#,
-            vec![keys.leases.clone()],
-            vec!["1".to_string(), claimed_id.to_string()],
+            r#"
+redis.call('LREM', KEYS[1], 0, ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[3], ARGV[1])
+return 1
+"#,
+            vec![
+                keys.queue.clone(),
+                keys.state(&job.job_id),
+                keys.leases.clone(),
+            ],
+            vec![job.job_id.clone(), claimed_json.clone(), "1".to_owned()],
         )
-        .await?;
-        let claimed_state = r#"{"status":"Claimed","worker_id":"w","lease_id":"l","lease_expires_ms":1,"attempt":3}"#;
-        pool.set::<(), _, _>(
-            keys.state(claimed_id),
-            claimed_state,
-            None,
-            None,
-            false,
+        .await
+        .context("failed to seed expired Claimed lease")?;
+
+        let backend = RedisProofBackend {
+            pool: pool.clone(),
+            keys: keys.clone(),
+            wait_interval: Duration::from_millis(10),
+        };
+        let wait = tokio::time::timeout(
+            Duration::from_millis(150),
+            backend.wait_result(&job),
         )
-        .await?;
-
-        let requeued: i64 = pool
-            .eval::<i64, _, _, _>(
-                REQUEUE_EXPIRED_SCRIPT,
-                vec![keys.leases.clone(), keys.queue.clone()],
-                vec!["100".to_string(), keys.state_prefix()],
-            )
-            .await
-            .context("REQUEUE_EXPIRED_SCRIPT eval failed")?;
-        anyhow::ensure!(requeued == 1, "requeue must report exactly one requeued lease, got {requeued}");
-
-        let state_after: Option<String> = pool.get(keys.state(claimed_id)).await?;
+        .await;
         anyhow::ensure!(
-            state_after.as_deref() == Some(r#"{"status":"Queued"}"#),
-            "requeue must transition the expired Claimed lease to Queued, got {state_after:?}"
+            wait.is_err(),
+            "coordinator wait must remain pending while the worker owns an expired claim"
         );
-        let queue_after_requeue: Vec<String> = pool.lrange(keys.queue.clone(), 0, -1).await?;
+
+        let state_after: Option<String> = pool.get(keys.state(&job.job_id)).await?;
         anyhow::ensure!(
-            queue_after_requeue == vec![job.job_id.clone(), claimed_id.to_string()],
-            "requeue must append the requeued job id to the queue, got {queue_after_requeue:?}"
+            state_after.as_deref() == Some(claimed_json.as_str()),
+            "coordinator wait must not rewrite expired Claimed state, got {state_after:?}"
         );
-        let zcard_lease: i64 = pool
+        let queue_after_wait: Vec<String> = pool.lrange(keys.queue.clone(), 0, -1).await?;
+        anyhow::ensure!(
+            queue_after_wait.is_empty(),
+            "coordinator wait must not re-enqueue an expired claim, got {queue_after_wait:?}"
+        );
+        let lease_count: i64 = pool
             .eval::<i64, _, _, _>(
                 r#"return redis.call('ZCARD', KEYS[1])"#,
                 vec![keys.leases.clone()],
@@ -1443,71 +1382,8 @@ mod tests {
             )
             .await?;
         anyhow::ensure!(
-            zcard_lease == 0,
-            "requeue must ZREM the expired lease, leases ZCARD must be 0, got {zcard_lease}"
-        );
-
-        // ---- REQUEUE: a terminal/malformed state under a due lease only
-        //      clears the ZSET entry and never re-enqueues the job. ----
-        let terminal_id = "terminal-job";
-        pool.eval::<i64, _, _, _>(
-            r#"redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2]) return 1"#,
-            vec![keys.leases.clone()],
-            vec!["1".to_string(), terminal_id.to_string()],
-        )
-        .await?;
-        pool.set::<(), _, _>(
-            keys.state(terminal_id),
-            r#"{"status":"Completed","completed_ms":0,"attempt":1}"#,
-            None,
-            None,
-            false,
-        )
-        .await?;
-
-        let malformed_id = "malformed-job";
-        pool.eval::<i64, _, _, _>(
-            r#"redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2]) return 1"#,
-            vec![keys.leases.clone()],
-            vec!["1".to_string(), malformed_id.to_string()],
-        )
-        .await?;
-        pool.set::<(), _, _>(
-            keys.state(malformed_id),
-            "not-json-at-all",
-            None,
-            None,
-            false,
-        )
-        .await?;
-
-        let requeued_terminal: i64 = pool
-            .eval::<i64, _, _, _>(
-                REQUEUE_EXPIRED_SCRIPT,
-                vec![keys.leases.clone(), keys.queue.clone()],
-                vec!["100".to_string(), keys.state_prefix()],
-            )
-            .await
-            .context("REQUEUE_EXPIRED_SCRIPT (terminal/malformed) eval failed")?;
-        anyhow::ensure!(
-            requeued_terminal == 0,
-            "terminal/malformed leases must not be requeued, got count {requeued_terminal}"
-        );
-        let queue_after_terminal: Vec<String> = pool.lrange(keys.queue.clone(), 0, -1).await?;
-        anyhow::ensure!(
-            queue_after_terminal == vec![job.job_id.clone(), claimed_id.to_string()],
-            "terminal/malformed requeue pass must not append to the queue, got {queue_after_terminal:?}"
-        );
-        let zcard_after_terminal: i64 = pool
-            .eval::<i64, _, _, _>(
-                r#"return redis.call('ZCARD', KEYS[1])"#,
-                vec![keys.leases.clone()],
-                Vec::<String>::new(),
-            )
-            .await?;
-        anyhow::ensure!(
-            zcard_after_terminal == 0,
-            "terminal/malformed leases must still be ZREM'd from the ZSET, ZCARD must be 0, got {zcard_after_terminal}"
+            lease_count == 1,
+            "coordinator wait must leave the worker-owned expired lease intact, got ZCARD {lease_count}"
         );
 
         Ok(())
