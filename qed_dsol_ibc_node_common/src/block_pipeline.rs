@@ -25,6 +25,7 @@ use doge_light_client::{
         hash_impl_sha256_two_to_one_bytes,
     },
     init_params::InitBlockDataIBC,
+    doge::transaction::BTCTransaction,
 };
 use fred::{
     prelude::{ClientLike, Config, KeysInterface, ReconnectPolicy},
@@ -44,6 +45,7 @@ use psy_doge_bridge_helper::{
             transition_builder::{calcuate_fee, hash_deposit_leaf, BlockTransitionBuilder},
             validator::{
                 block_witness::{
+                    combined_txo_index, pending_mint_and_txo_hashes_from_claim_witness,
                     PsyBridgeClaimBlockWitness, PsyBridgeClaimBlockWitnessHeader,
                     PsyBridgeClaimBlockWitnessVerifyResult,
                 },
@@ -1232,11 +1234,21 @@ impl BlockPipeline {
         let finalized_height = height
             .checked_sub(self.config.required_confirmations)
             .ok_or_else(|| anyhow::anyhow!("finalized height underflow"))?;
-        let finalized_buffers = checkpoint
-            .pending_finalization
-            .get(&finalized_height)
-            .cloned()
-            .unwrap_or(BlockBufferCommitment::empty()?);
+        let redis_finalized_buffers = checkpoint.pending_finalization.get(&finalized_height);
+        let finalized_block = if redis_finalized_buffers.is_some() {
+            Some(self.block_rpc.get_qd_block(finalized_height).await?)
+        } else {
+            None
+        };
+        let (finalized_buffers, finalized_witness) = resolve_finalized_buffers::<P>(
+            finalized_block.as_ref(),
+            redis_finalized_buffers,
+            &custody_script_config,
+            &self.config.recipient_atas,
+            deposit_flat_fee(&self.config.config_params),
+            deposit_fee_numerator(&self.config.config_params),
+            deposit_fee_denominator(&self.config.config_params),
+        )?;
 
         let mut new_state = old_state;
         new_state.append_block::<NC>(
@@ -1341,6 +1353,7 @@ impl BlockPipeline {
             request_id: format!("block-{height}"),
             old_state: hex::encode(&old_state_bytes),
             witness: hex::encode(&witness_bytes),
+            finalized_witness,
             custody_script_config: hex::encode(self.config.custody_script_config),
             required_confirmations: self.config.required_confirmations,
             flat_fee: deposit_flat_fee(&self.config.config_params),
@@ -1870,11 +1883,33 @@ pub async fn recover_checkpoint_from_proof_archive(
     let finalized_height = height
         .checked_sub(config.required_confirmations)
         .ok_or_else(|| anyhow::anyhow!("finalized height underflow"))?;
-    let finalized_buffers = checkpoint
-        .pending_finalization
-        .get(&finalized_height)
-        .cloned()
-        .unwrap_or(BlockBufferCommitment::empty()?);
+    let block_rpc = DogeLinkElectrsAsyncClient::new(config.electrs_url.clone());
+    let redis_finalized_buffers = checkpoint.pending_finalization.get(&finalized_height);
+    let finalized_block = if redis_finalized_buffers.is_some() {
+        Some(block_rpc.get_qd_block(finalized_height).await?)
+    } else {
+        None
+    };
+    let finalized_buffers = match config.network {
+        DogeNetworkProfile::Regtest => resolve_finalized_buffers::<LocalRegtestManagerCustody>(
+            finalized_block.as_ref(),
+            redis_finalized_buffers,
+            &custody_script_config,
+            &config.recipient_atas,
+            deposit_flat_fee(&config.config_params),
+            deposit_fee_numerator(&config.config_params),
+            deposit_fee_denominator(&config.config_params),
+        )?.0,
+        DogeNetworkProfile::Testnet => resolve_finalized_buffers::<OfficialTestnetManagerCustody>(
+            finalized_block.as_ref(),
+            redis_finalized_buffers,
+            &custody_script_config,
+            &config.recipient_atas,
+            deposit_flat_fee(&config.config_params),
+            deposit_fee_numerator(&config.config_params),
+            deposit_fee_denominator(&config.config_params),
+        )?.0,
+    };
     let old_header = decode_fixed::<HEADER_SIZE>(&checkpoint.header_hex, "checkpoint header")?;
     let new_header = build_new_solana_header(
         &old_header,
@@ -2197,12 +2232,78 @@ fn decode_dogecoin_txid(value: &str) -> anyhow::Result<QHash256> {
     Ok(bytes)
 }
 
-fn build_deposit_claim_witness<P: ManagerCustodyProfile>(
+fn build_hash_only_incoming_witness<P: ManagerCustodyProfile>(
     block: &QDogeBlock,
-    checkpoint: &PipelineCheckpoint,
     custody_script_config: &CustodyScriptConfig,
     recipient_atas: &[[u8; 32]],
 ) -> anyhow::Result<PsyDogeBridgeIncomingBlockWitness> {
+    let (total_outputs, deposit_transactions) =
+        scan_manager_custody_deposits::<P>(block, custody_script_config, recipient_atas)?;
+    let claim_siblings = core::array::from_fn(|index| SHA256_ZERO_HASHES[index]);
+    let txo_siblings = core::array::from_fn(|index| {
+        SHA256_ZERO_HASHES[TXO_BLOCK_FULL_MERKLE_TREE_HEIGHT + index]
+    });
+
+    Ok(PsyDogeBridgeIncomingBlockWitness {
+        block_header: block.to_qdoge_block_header(),
+        claim_witness: PsyBridgeClaimBlockWitness::new(
+            PsyBridgeClaimBlockWitnessHeader {
+                txo_tree_block_siblings: txo_siblings,
+                last_auto_claimed_deposits_siblings: claim_siblings,
+                total_outputs_hint: total_outputs,
+                claim_deposits_last_index: 0,
+                claim_deposits_last_value: [0u8; 32],
+            },
+            recipient_atas.to_vec(),
+            deposit_transactions,
+        ),
+        previous_header_last_rollback_at_secs: 0,
+        previous_header_paused_until_secs: 0,
+    })
+}
+
+fn resolve_finalized_buffers<P: ManagerCustodyProfile>(
+    block: Option<&QDogeBlock>,
+    redis_buffers: Option<&BlockBufferCommitment>,
+    custody_script_config: &CustodyScriptConfig,
+    recipient_atas: &[[u8; 32]],
+    flat_fee_per_deposit_sats: u64,
+    deposit_fee_rate_numerator: u64,
+    deposit_fee_rate_denominator: u64,
+) -> anyhow::Result<(BlockBufferCommitment, String)> {
+    let Some(redis_buffers) = redis_buffers else {
+        return Ok((BlockBufferCommitment::empty()?, String::new()));
+    };
+    let block = block.ok_or_else(|| anyhow::anyhow!("finalized Electrs block is missing"))?;
+    let witness =
+        build_hash_only_incoming_witness::<P>(block, custody_script_config, recipient_atas)?;
+    let (pending_mints_hash, txo_output_list_hash) =
+        pending_mint_and_txo_hashes_from_claim_witness::<P>(
+            &witness.claim_witness,
+            block.header.merkle_root,
+            custody_script_config,
+            flat_fee_per_deposit_sats,
+            deposit_fee_rate_numerator,
+            deposit_fee_rate_denominator,
+        )?;
+    if redis_buffers.pending_mints_hash()? != pending_mints_hash {
+        anyhow::bail!("Redis pending-mint hash disagrees with finalized Electrs witness");
+    }
+    if redis_buffers.txo_output_list_hash()? != txo_output_list_hash {
+        anyhow::bail!("Redis TXO-list hash disagrees with finalized Electrs witness");
+    }
+
+    let mut finalized_buffers = redis_buffers.clone();
+    finalized_buffers.pending_mints_hash_hex = hex::encode(pending_mints_hash);
+    finalized_buffers.txo_output_list_hash_hex = hex::encode(txo_output_list_hash);
+    Ok((finalized_buffers, hex::encode(witness.write_to_vec()?)))
+}
+
+fn scan_manager_custody_deposits<P: ManagerCustodyProfile>(
+    block: &QDogeBlock,
+    custody_script_config: &CustodyScriptConfig,
+    recipient_atas: &[[u8; 32]],
+) -> anyhow::Result<(u32, Vec<PsyBridgeClaimBlockTransactionWitness>)> {
     if block.transactions.is_empty() {
         anyhow::bail!("Electrs block contains no transactions");
     }
@@ -2210,7 +2311,7 @@ fn build_deposit_claim_witness<P: ManagerCustodyProfile>(
     let transaction_hashes: Vec<QHash256> = block
         .transactions
         .iter()
-        .map(|transaction| transaction.get_hash())
+        .map(BTCTransaction::get_hash)
         .collect();
     let computed_merkle_root = bitcoin_merkle_root(&transaction_hashes)
         .ok_or_else(|| anyhow::anyhow!("cannot compute an empty block transaction Merkle root"))?;
@@ -2259,6 +2360,18 @@ fn build_deposit_claim_witness<P: ManagerCustodyProfile>(
             ));
         }
     }
+
+    Ok((total_outputs, deposit_transactions))
+}
+
+fn build_deposit_claim_witness<P: ManagerCustodyProfile>(
+    block: &QDogeBlock,
+    checkpoint: &PipelineCheckpoint,
+    custody_script_config: &CustodyScriptConfig,
+    recipient_atas: &[[u8; 32]],
+) -> anyhow::Result<PsyDogeBridgeIncomingBlockWitness> {
+    let (total_outputs, deposit_transactions) =
+        scan_manager_custody_deposits::<P>(block, custody_script_config, recipient_atas)?;
 
     let claim_last_value =
         decode_hash(&checkpoint.claim_frontier.value_hex, "claim frontier value")?;
@@ -2411,8 +2524,15 @@ fn evaluate_claim_witness<P: ManagerCustodyProfile>(
     )?;
     let block_txo_root = builder.txo_claimed_txs_in_block_tree.current_root;
     let minted_amount_sats = builder.total_deposit_amount;
-    let pending_mints_hash = builder.pending_mints.finalize()?;
-    let txo_output_list_hash = hash_impl_sha256_bytes(&serialize_txo_indices(&txo_indices));
+    let (pending_mints_hash, txo_output_list_hash) =
+        pending_mint_and_txo_hashes_from_claim_witness::<P>(
+            witness,
+            block_transaction_tree_merkle_root,
+            custody_script_config,
+            flat_fee_per_deposit_sats,
+            deposit_fee_rate_numerator,
+            deposit_fee_rate_denominator,
+        )?;
 
     Ok(ClaimEvaluation {
         transition,
@@ -2659,6 +2779,7 @@ pub(crate) async fn prepare_prover_request(
             "network": config.network.as_str(),
             "old_state": request.old_state,
             "witness": request.witness,
+            "finalized_witness": request.finalized_witness,
             "custody_script_config": request.custody_script_config,
             "required_confirmations": request.required_confirmations,
             "flat_fee": request.flat_fee,
@@ -3033,14 +3154,6 @@ fn validate_buffer_payload(
     Ok(())
 }
 
-fn combined_txo_index(transaction_index: u32, output_index: u32) -> anyhow::Result<u32> {
-    const MAX_OUTPUTS_PER_TX: u32 =
-        psy_doge_bridge_helper::claim::block_tx_output_tree::TXO_TREE_MAX_OUTPUTS_PER_TX as u32;
-    transaction_index
-        .checked_mul(MAX_OUTPUTS_PER_TX)
-        .and_then(|index| index.checked_add(output_index))
-        .ok_or_else(|| anyhow::anyhow!("combined TXO index overflow"))
-}
 
 fn read_pipeline_keypair(path: &Path, name: &str) -> anyhow::Result<Keypair> {
     read_keypair_file(path).map_err(|error| {
@@ -4363,6 +4476,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evaluation.deposit_count, 1);
+        let helper_hashes = pending_mint_and_txo_hashes_from_claim_witness::<
+            LocalRegtestManagerCustody,
+        >(
+            &witness.claim_witness,
+            block.header.merkle_root,
+            &CUSTODY_SCRIPT_CONFIG,
+            0,
+            0,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            helper_hashes,
+            (evaluation.pending_mints_hash, evaluation.txo_output_list_hash)
+        );
         assert_eq!(evaluation.minted_amount_sats, deposit_amount);
         assert_eq!(evaluation.pending_mints.len(), 1);
         assert_eq!(evaluation.pending_mints[0].recipient, RECIPIENT_ATA);
@@ -4392,6 +4520,96 @@ mod tests {
         assert_ne!(evaluation.txo_output_list_hash, hash_impl_sha256_bytes(&[]));
     }
 
+
+    #[test]
+    fn poisoned_redis_hashes_fail_finalized_resolver() {
+        let (empty_buffers, empty_witness) = resolve_finalized_buffers::<
+            LocalRegtestManagerCustody,
+        >(None, None, &CUSTODY_SCRIPT_CONFIG, &[RECIPIENT_ATA], 0, 0, 100)
+        .unwrap();
+        assert!(empty_witness.is_empty());
+        assert_eq!(
+            empty_buffers.pending_mints_hash().unwrap(),
+            PendingMintsGroupsBuilder::new_with_hint(0)
+                .finalize()
+                .unwrap()
+        );
+        assert_eq!(
+            empty_buffers.txo_output_list_hash().unwrap(),
+            hash_impl_sha256_bytes(&[])
+        );
+
+        let height = 101;
+        let deposit_amount = 100_000_000;
+        let block = block(
+            height,
+            vec![transaction(vec![BTCTransactionOutput {
+                value: deposit_amount,
+                script: get_manager_custody_output_script::<LocalRegtestManagerCustody>(
+                    &CUSTODY_SCRIPT_CONFIG,
+                    &RECIPIENT_ATA,
+                )
+                .to_vec(),
+            }])],
+        );
+        let witness = build_hash_only_incoming_witness::<LocalRegtestManagerCustody>(
+            &block,
+            &CUSTODY_SCRIPT_CONFIG,
+            &[RECIPIENT_ATA],
+        )
+        .unwrap();
+        let (mint_hash, txo_hash) = pending_mint_and_txo_hashes_from_claim_witness::<
+            LocalRegtestManagerCustody,
+        >(
+            &witness.claim_witness,
+            block.header.merkle_root,
+            &CUSTODY_SCRIPT_CONFIG,
+            0,
+            0,
+            100,
+        )
+        .unwrap();
+        let mut poisoned = BlockBufferCommitment {
+            pending_mints_hash_hex: hex::encode(mint_hash),
+            txo_output_list_hash_hex: hex::encode(txo_hash),
+            pending_mints: vec![PendingMintPayload {
+                recipient: RECIPIENT_ATA,
+                amount: deposit_amount,
+            }],
+            txo_indices: vec![0],
+            deposit_count: 1,
+            minted_amount_sats: deposit_amount,
+            auto_claim_start_index: 0,
+            auto_claim_end_index: 1,
+            fees_collected: 0,
+        };
+        poisoned.pending_mints_hash_hex = hex::encode([0xAA; 32]);
+        let error = resolve_finalized_buffers::<LocalRegtestManagerCustody>(
+            Some(&block),
+            Some(&poisoned),
+            &CUSTODY_SCRIPT_CONFIG,
+            &[RECIPIENT_ATA],
+            0,
+            0,
+            100,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pending-mint hash disagrees"));
+
+        poisoned.pending_mints_hash_hex = hex::encode(mint_hash);
+        poisoned.txo_output_list_hash_hex = hex::encode([0xBB; 32]);
+        let error = resolve_finalized_buffers::<LocalRegtestManagerCustody>(
+            Some(&block),
+            Some(&poisoned),
+            &CUSTODY_SCRIPT_CONFIG,
+            &[RECIPIENT_ATA],
+            0,
+            0,
+            100,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("TXO-list hash disagrees"));
+    }
     #[test]
     fn legacy_59_byte_custody_output_is_not_scanned_as_manager_deposit() {
         let height = 102;

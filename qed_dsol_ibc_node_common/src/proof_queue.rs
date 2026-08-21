@@ -13,8 +13,8 @@ use crate::block_pipeline::{
     prepare_prover_request, BlockPipelineConfig, ProverDaemon, ProverOutput, ProverRequestError,
 };
 
-pub const PROOF_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_QUEUE_PREFIX: &str = "PDOGE-SP1-PROOF-V1";
+pub const PROOF_SCHEMA_VERSION: u32 = 2;
+pub const DEFAULT_QUEUE_PREFIX: &str = "PDOGE-SP1-PROOF-V2";
 
 /// Atomically creates a durable job, or accepts an identical previously-created job.
 /// Completed/failed jobs are intentionally retained so a restarted submitter can reuse the
@@ -46,6 +46,7 @@ pub struct ProofRequest {
     pub request_id: String,
     pub old_state: String,
     pub witness: String,
+    pub finalized_witness: String,
     pub custody_script_config: String,
     pub required_confirmations: u32,
     pub flat_fee: u64,
@@ -793,6 +794,7 @@ mod tests {
             request_id: "block-42".to_owned(),
             old_state: "00".to_owned(),
             witness: "11".to_owned(),
+            finalized_witness: String::new(),
             custody_script_config: "22".repeat(32),
             required_confirmations: 6,
             flat_fee: 1,
@@ -823,6 +825,9 @@ mod tests {
         job.validate().unwrap();
         let mut changed = job.clone();
         changed.request.witness = "12".to_owned();
+        assert!(changed.validate().is_err());
+        let mut changed = job.clone();
+        changed.request.finalized_witness = "13".to_owned();
         assert!(changed.validate().is_err());
         let mut changed = job.clone();
         changed.parent_checkpoint_sha256 = "67".repeat(32);
@@ -883,12 +888,12 @@ mod tests {
     #[test]
     fn namespace_and_keys_match_protocol() {
         let namespace = proof_namespace(DEFAULT_QUEUE_PREFIX, "testnet", 1337);
-        assert_eq!(namespace, "PDOGE-SP1-PROOF-V1-testnet-1337");
+        assert_eq!(namespace, "PDOGE-SP1-PROOF-V2-testnet-1337");
         let keys = QueueKeys::new(namespace);
-        assert_eq!(keys.queue, "PDOGE-SP1-PROOF-V1-testnet-1337:queue");
-        assert_eq!(keys.job("abc"), "PDOGE-SP1-PROOF-V1-testnet-1337:job:abc");
-        assert_eq!(keys.state("abc"), "PDOGE-SP1-PROOF-V1-testnet-1337:state:abc");
-        assert_eq!(keys.result("abc"), "PDOGE-SP1-PROOF-V1-testnet-1337:result:abc");
+        assert_eq!(keys.queue, "PDOGE-SP1-PROOF-V2-testnet-1337:queue");
+        assert_eq!(keys.job("abc"), "PDOGE-SP1-PROOF-V2-testnet-1337:job:abc");
+        assert_eq!(keys.state("abc"), "PDOGE-SP1-PROOF-V2-testnet-1337:state:abc");
+        assert_eq!(keys.result("abc"), "PDOGE-SP1-PROOF-V2-testnet-1337:result:abc");
     }
     fn daemon_response_json(job: &ProofJob, proof: &[u8], public_values: &[u8]) -> serde_json::Value {
         serde_json::json!({
